@@ -1,52 +1,47 @@
 # slack-shape-bot
 
-Slack bot that receives app ideas and evaluates them using shape-request logic (GO / WAIT / REJECT) via Claude API.
+Slack bot that receives app ideas, evaluates them with shape-request logic (GO / WAIT / REJECT), and — when GO — automatically creates a GitHub repo, implements the MVP, and opens a PR.
 
-## Overview
+## Flow
 
-Post a message like "I want to build ○○ app" in Slack, and the bot automatically:
-1. Detects the request
-2. Evaluates feasibility using Claude API (shape-request prompt)
-3. Returns GO / WAIT / REJECT judgment with reasoning to the thread
+```
+You (Slack)         Bot                        Workspace
+-----------         ---                        ---------
+"○○なアプリ作りたい"
+                → shape-request 評価
+                ← GO / WAIT / REJECT (thread)
+"my-app"  ←←←← (GO の場合) プロジェクト名を質問
+                → /workspace/my-app を作成
+                → GitHub repo 作成 & push
+                → claude -p で実装
+                → gh pr create
+                ← PR URL (thread)
+```
 
 ## Stack
 
 - Python 3.11+
 - [slack_bolt](https://github.com/slackapi/bolt-python) (Socket Mode)
 - [anthropic](https://github.com/anthropics/anthropic-sdk-python)
+- [claude CLI](https://github.com/anthropics/claude-code) — MVP 実装に使用
 - Docker / docker compose
 
-## Trigger
+## Trigger keywords
 
-Messages containing any of: `作りたい` `したい` `欲しい` `アプリ` `ツール` `bot` `システム` `サービス` `機能` `自動化`
-
-The bot replies to the message thread with a GO / WAIT / REJECT evaluation.
+`作りたい` `したい` `欲しい` `アプリ` `ツール` `bot` `システム` `サービス` `機能` `自動化`
 
 ## Setup (Docker — recommended)
 
 ```bash
 cp .env.example .env
-# Fill in SLACK_BOT_TOKEN, SLACK_APP_TOKEN, ANTHROPIC_API_KEY
+# .env を編集してトークンを記入
 
 docker compose up -d
 ```
 
-The bot runs as a persistent container (`restart: unless-stopped`).
-
 ```bash
-# View logs
-docker compose logs -f
-
-# Stop
-docker compose down
-```
-
-## Setup (local)
-
-```bash
-cp .env.example .env
-pip install -r requirements.txt
-python main.py
+docker compose logs -f   # ログ確認
+docker compose down      # 停止
 ```
 
 ## Environment Variables
@@ -56,3 +51,27 @@ python main.py
 | `SLACK_BOT_TOKEN` | Bot User OAuth Token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | App-Level Token for Socket Mode (`xapp-...`) |
 | `ANTHROPIC_API_KEY` | Anthropic API key |
+| `GITHUB_OWNER` | GitHub ユーザー名または Org 名（default: `reisun`） |
+| `HOST_WORKSPACE` | ホスト側の workspace パス（default: `/home/reisun/workspace`） |
+| `WORKSPACE_DIR` | コンテナ内の workspace パス（default: `/workspace`） |
+
+## Slack App の設定
+
+1. https://api.slack.com/apps でアプリを作成
+2. **Socket Mode** を有効化 → App-Level Token (`xapp-...`) を発行
+3. **Event Subscriptions** → Subscribe to bot events:
+   - `message.channels`（パブリックチャンネル）
+   - `message.groups`（プライベートチャンネル）
+4. **OAuth & Permissions** → Bot Token Scopes:
+   - `chat:write`
+   - `reactions:write`
+   - `channels:history`（または `groups:history`）
+5. ワークスペースにインストール → Bot Token (`xoxb-...`) をコピー
+
+## Volume mounts (docker-compose.yml)
+
+| Host | Container | 用途 |
+|------|-----------|------|
+| `HOST_WORKSPACE` | `/workspace` | 新規プロジェクトの作成先 |
+| `~/.config/gh` | `/root/.config/gh` | gh CLI 認証 |
+| `~/.claude` | `/root/.claude` | claude CLI 認証 |
