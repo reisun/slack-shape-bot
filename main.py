@@ -10,7 +10,7 @@ import anthropic
 
 load_dotenv()
 
-WORKSPACE = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
+WORKSPACE = Path(os.environ["WORKSPACE_DIR"])
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "reisun")
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])

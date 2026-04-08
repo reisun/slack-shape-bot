@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     volumes:
       # host workspace mounted so the bot can create project directories
-      - ${HOST_WORKSPACE:-/home/reisun/workspace}:/workspace
+      - ${HOST_WORKSPACE}:/workspace
       # gh CLI auth (read-only)
       - ${HOME}/.config/gh:/root/.config/gh:ro
       # claude CLI auth
