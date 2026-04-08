@@ -14,13 +14,37 @@ Post a message like "I want to build ○○ app" in Slack, and the bot automatic
 - Python 3.11+
 - [slack_bolt](https://github.com/slackapi/bolt-python) (Socket Mode)
 - [anthropic](https://github.com/anthropics/anthropic-sdk-python)
+- Docker / docker compose
 
-## Setup
+## Trigger
+
+Messages containing any of: `作りたい` `したい` `欲しい` `アプリ` `ツール` `bot` `システム` `サービス` `機能` `自動化`
+
+The bot replies to the message thread with a GO / WAIT / REJECT evaluation.
+
+## Setup (Docker — recommended)
 
 ```bash
 cp .env.example .env
 # Fill in SLACK_BOT_TOKEN, SLACK_APP_TOKEN, ANTHROPIC_API_KEY
 
+docker compose up -d
+```
+
+The bot runs as a persistent container (`restart: unless-stopped`).
+
+```bash
+# View logs
+docker compose logs -f
+
+# Stop
+docker compose down
+```
+
+## Setup (local)
+
+```bash
+cp .env.example .env
 pip install -r requirements.txt
 python main.py
 ```
