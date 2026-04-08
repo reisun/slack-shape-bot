@@ -6,84 +6,62 @@ from pathlib import Path
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-import anthropic
 
 load_dotenv()
 
 WORKSPACE = Path(os.environ["WORKSPACE_DIR"])
-GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "reisun")
+GITHUB_OWNER = os.environ["GITHUB_OWNER"]
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
-claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 TRIGGER_PATTERN = re.compile(
     r"(作りたい|したい|欲しい|○○な|アプリ|ツール|bot|Bot|システム|サービス|機能|自動化)",
     re.IGNORECASE,
 )
 
-SHAPE_SYSTEM_PROMPT = """あなたはアプリ要望の受付役・プロデューサーです。
-ユーザーから「○○なアプリを作りたい」などの要望を受け取り、以下の観点で評価してください。
-
-評価観点:
-1. 1日で動く最小形（MVP）にできそうか
-2. シンプルに始められそうか（複雑な依存・設計が不要か）
-3. やる価値があるか（明確なユースケースがあるか）
-
-判定基準:
-- GO: 上記3つを満たす
-- WAIT: 価値はあるが、そのままでは1日で動かない / 複雑で工夫が必要
-- REJECT: 価値が弱い / 複雑さに見合わない
-
-出力フォーマット（マークダウン）:
-## 要望の要約
-（1〜2文で）
-
-## 利用場面
-（誰がいつどう使うか）
-
-## 狙い
-（解決したい課題・得たい価値）
-
-## 判定
-**GO** / **WAIT** / **REJECT**（どれか一つ）
-
-## 判定理由
-（2〜3文で）
-
-## 次アクション
-（GO の場合は粗いタスク文、WAIT は何が解消されれば GO になるか、REJECT は代替案など）
-
-回答は日本語で、簡潔に。余計な前置きは不要。"""
-
 # thread_ts -> {task: str, channel: str}
 pending: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
-# Claude API: idea evaluation
+# claude CLI helper
+# ---------------------------------------------------------------------------
+
+def run_claude(prompt: str, cwd: str | None = None, timeout: int = 300) -> tuple[int, str]:
+    """Run claude -p <prompt> and return (returncode, stdout)."""
+    result = subprocess.run(
+        ["claude", "-p", prompt, "--dangerously-skip-permissions"],
+        cwd=cwd or str(WORKSPACE),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return result.returncode, result.stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# Idea evaluation via /shape-request skill
 # ---------------------------------------------------------------------------
 
 def evaluate_idea(text: str) -> tuple[str, str, str]:
-    """Returns (judgment, full_response, task_description)."""
-    response = claude.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=1024,
-        system=SHAPE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": text}],
-    )
-    result = response.content[0].text
+    """Returns (judgment, full_response, task_description).
 
-    if "**GO**" in result:
+    Calls the workspace /shape-request skill so the evaluation logic
+    stays in sync with .claude/skills/shape-request.
+    """
+    _, output = run_claude(f"/shape-request {text}")
+
+    if "**GO**" in output:
         judgment = "GO"
-    elif "**WAIT**" in result:
+    elif "**WAIT**" in output:
         judgment = "WAIT"
     else:
         judgment = "REJECT"
 
-    task_match = re.search(r"## 次アクション\n(.+?)(?:\n##|$)", result, re.DOTALL)
+    task_match = re.search(r"## 次アクション\n(.+?)(?:\n##|$)", output, re.DOTALL)
     task_description = task_match.group(1).strip() if task_match else text
 
-    return judgment, result, task_description
+    return judgment, output, task_description
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +80,7 @@ def setup_repo(repo_name: str, task_description: str) -> Path:
     (project_dir / "README.md").write_text(f"# {repo_name}\n\n{task_description}\n")
     (project_dir / ".gitignore").write_text("__pycache__/\n*.py[cod]\n.env\n.venv/\n")
     (project_dir / "TASK.md").write_text(
-        f"# TASK\n\n## Backlog\n\n- [ ] Initial implementation\n"
+        "# TASK\n\n## Backlog\n\n- [ ] Initial implementation\n"
     )
 
     cwd = str(project_dir)
@@ -124,14 +102,12 @@ def setup_repo(repo_name: str, task_description: str) -> Path:
 
 
 def run_implementation(project_dir: Path, task_description: str) -> bool:
-    prompt = (
-        f"作業ディレクトリ: {project_dir}\n\n"
-        f"{task_description}\n\n"
-        "シンプルに動く最小実装を行ってください。"
-    )
-    code, _, _ = _run(
-        ["claude", "-p", prompt, "--dangerously-skip-permissions"],
+    # Run with cwd=project_dir; claude will still find WORKSPACE/.claude/skills
+    # via parent-directory traversal
+    code, _ = run_claude(
+        f"/direct-task {task_description}",
         cwd=str(project_dir),
+        timeout=600,
     )
     return code == 0
 
@@ -140,7 +116,7 @@ def create_pr(project_dir: Path, repo_name: str, task_description: str) -> str:
     cwd = str(project_dir)
     _run(["git", "add", "."], cwd)
     rc, _, _ = _run(["git", "diff", "--cached", "--quiet"], cwd)
-    if rc != 0:  # there are staged changes
+    if rc != 0:
         _run(["git", "commit", "-m", "Implement initial version"], cwd)
 
     _run(["git", "push", "-u", "origin", "feature/initial-implementation"], cwd)
@@ -166,7 +142,7 @@ def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts:
     try:
         post(f":hammer_and_wrench: リポジトリ `{repo_name}` を作成中...")
         project_dir = setup_repo(repo_name, task_description)
-        post(f":robot_face: 実装中... しばらくお待ちください")
+        post(":robot_face: 実装中... しばらくお待ちください")
         run_implementation(project_dir, task_description)
         post(":twisted_rightwards_arrows: PR を作成中...")
         pr_url = create_pr(project_dir, repo_name, task_description)
@@ -187,7 +163,7 @@ def handle_message(event, say, client):
     text = event.get("text", "")
     thread_ts = event.get("thread_ts")
 
-    # Reply in a thread that is waiting for a project name
+    # Reply in a thread waiting for a project name
     if thread_ts and thread_ts in pending:
         raw = text.strip().lower()
         repo_name = re.sub(r"[^a-z0-9-]", "-", raw).strip("-")
