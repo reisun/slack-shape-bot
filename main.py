@@ -22,6 +22,9 @@ TRIGGER_PATTERN = re.compile(
 # thread_ts -> {task: str, channel: str}
 pending: dict[str, dict] = {}
 
+# thread_ts -> {original: str, history: list[str], channel: str}
+waiting: dict[str, dict] = {}
+
 
 # ---------------------------------------------------------------------------
 # claude CLI helper
@@ -36,7 +39,11 @@ def run_claude(prompt: str, cwd: str | None = None, timeout: int = 300) -> tuple
         text=True,
         timeout=timeout,
     )
-    return result.returncode, result.stdout.strip()
+    output = result.stdout.strip()
+    if not output and result.stderr.strip():
+        print(f"[claude stderr] {result.stderr.strip()[:500]}", flush=True)
+        output = result.stderr.strip()
+    return result.returncode, output
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +69,12 @@ def evaluate_idea(text: str) -> tuple[str, str, str]:
     task_description = task_match.group(1).strip() if task_match else text
 
     return judgment, output, task_description
+
+
+def reevaluate_idea(original: str, history: list[str]) -> tuple[str, str, str]:
+    """Re-evaluate with conversation history appended to the original request."""
+    conversation = original + "\n\n--- 追加情報 ---\n" + "\n".join(history)
+    return evaluate_idea(conversation)
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +115,6 @@ def setup_repo(repo_name: str, task_description: str) -> Path:
 
 
 def run_implementation(project_dir: Path, task_description: str) -> bool:
-    # Run with cwd=project_dir; claude will still find WORKSPACE/.claude/skills
-    # via parent-directory traversal
     code, _ = run_claude(
         f"/direct-task {task_description}",
         cwd=str(project_dir),
@@ -163,12 +174,17 @@ def handle_message(event, say, client):
     text = event.get("text", "")
     thread_ts = event.get("thread_ts")
 
-    # Reply in a thread waiting for a project name
+    # Reply in a thread waiting for a project name (GO confirmed)
     if thread_ts and thread_ts in pending:
         raw = text.strip().lower()
         repo_name = re.sub(r"[^a-z0-9-]", "-", raw).strip("-")
-        if not repo_name:
-            say("リポジトリ名が不正です。英数字とハイフンのみ使えます。", thread_ts=thread_ts)
+        repo_name = re.sub(r"-{2,}", "-", repo_name)  # collapse consecutive hyphens
+        if not repo_name or len(repo_name) > 100:
+            say(
+                "リポジトリ名が不正です。英数字とハイフンのみ・100文字以内で入力してください。\n"
+                "例: `my-app`",
+                thread_ts=thread_ts,
+            )
             return
 
         info = pending.pop(thread_ts)
@@ -178,6 +194,40 @@ def handle_message(event, say, client):
             args=(repo_name, info["task"], event["channel"], thread_ts),
             daemon=True,
         ).start()
+        return
+
+    # Reply in a thread waiting for clarification (WAIT)
+    if thread_ts and thread_ts in waiting:
+        info = waiting[thread_ts]
+        info["history"].append(text)
+
+        ts = event["ts"]
+        try:
+            client.reactions_add(channel=event["channel"], name="thinking_face", timestamp=ts)
+        except Exception:
+            pass
+
+        judgment, result_text, task_description = reevaluate_idea(
+            info["original"], info["history"]
+        )
+        say(text=result_text, thread_ts=thread_ts)
+
+        try:
+            client.reactions_remove(channel=event["channel"], name="thinking_face", timestamp=ts)
+        except Exception:
+            pass
+
+        if judgment == "GO":
+            waiting.pop(thread_ts)
+            pending[thread_ts] = {"task": task_description, "channel": event["channel"]}
+            say(
+                "GO です！プロジェクト名を教えてください（例: `my-app`）\n"
+                "※ 英数字・ハイフンのみ",
+                thread_ts=thread_ts,
+            )
+        elif judgment == "REJECT":
+            waiting.pop(thread_ts)
+        # WAIT: keep waiting, history already updated
         return
 
     # New idea message
@@ -205,6 +255,12 @@ def handle_message(event, say, client):
             "※ 英数字・ハイフンのみ",
             thread_ts=ts,
         )
+    elif judgment == "WAIT":
+        waiting[ts] = {
+            "original": text,
+            "history": [],
+            "channel": event["channel"],
+        }
 
 
 if __name__ == "__main__":

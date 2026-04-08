@@ -17,5 +17,5 @@
 
 - [ ] Slack App の設定手順書（Socket Mode 有効化・権限スコープ）
 - [ ] エラー時の Slack 通知の改善（Claude API 障害など）
-- [ ] WAIT / REJECT 後の再提案フロー
+- [x] WAIT / REJECT 後の再提案フロー
 - [ ] 複数チャンネル同時対応のテスト
