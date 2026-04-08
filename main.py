@@ -5,7 +5,7 @@ import threading
 import subprocess
 from pathlib import Path
 from dotenv import load_dotenv
-from slack_bolt import App, Assistant, Say, SetStatus, SetSuggestedPrompts, SetTitle
+from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 load_dotenv()
@@ -20,6 +20,11 @@ WORKSPACE = Path(os.environ["WORKSPACE_DIR"])
 GITHUB_OWNER = os.environ["GITHUB_OWNER"]
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
+
+TRIGGER_PATTERN = re.compile(
+    r"(作りたい|したい|欲しい|○○な|アプリ|ツール|bot|Bot|システム|サービス|機能|自動化)",
+    re.IGNORECASE,
+)
 
 # thread_ts -> {task: str, channel: str}
 pending: dict[str, dict] = {}
@@ -122,7 +127,6 @@ def setup_repo(repo_name: str, task_description: str) -> Path:
         cwd,
     )
     if rc != 0:
-        # Repo may already exist — add remote and push manually
         logger.info("[setup] gh repo create failed (rc=%d), adding remote manually", rc)
         _run_checked(
             ["git", "remote", "add", "origin",
@@ -174,7 +178,10 @@ def create_pr(project_dir: Path, repo_name: str, task_description: str) -> str:
     return stdout.strip().split("\n")[-1]
 
 
-def run_pipeline(repo_name: str, task_description: str, post):
+def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts: str):
+    def post(msg: str):
+        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=msg)
+
     try:
         post(f":hammer_and_wrench: リポジトリ `{repo_name}` を作成中...")
         project_dir = setup_repo(repo_name, task_description)
@@ -194,104 +201,107 @@ def run_pipeline(repo_name: str, task_description: str, post):
 
 
 # ---------------------------------------------------------------------------
-# Slack Assistant
+# Slack event handler
 # ---------------------------------------------------------------------------
 
-assistant = Assistant()
+@app.event("message")
+def handle_message(event, say, client):
+    if event.get("bot_id") or event.get("subtype"):
+        return
 
+    text = event.get("text", "")
+    thread_ts = event.get("thread_ts")
+    channel = event.get("channel", "")
 
-@assistant.thread_started
-def handle_thread_started(say: Say, set_suggested_prompts: SetSuggestedPrompts):
-    say("こんにちは！作りたいものやアイデアを教えてください。評価してフィードバックします。")
-    set_suggested_prompts(prompts=[
-        {"title": "アイデアを相談", "message": "こんなアプリを作りたいです: "},
-        {"title": "ツールの自動化", "message": "この作業を自動化したいです: "},
-    ])
-
-
-@assistant.user_message
-def handle_user_message(payload: dict, say: Say, set_status: SetStatus, set_title: SetTitle):
-    text = payload.get("text", "")
-    thread_ts = payload.get("thread_ts", "")
-    channel = payload.get("channel", "")
-
-    logger.debug("user_message: thread_ts=%s pending=%s waiting=%s text=%s",
-                 thread_ts, list(pending.keys()), list(waiting.keys()), text[:80])
+    logger.debug("message: thread_ts=%s text=%s pending=%s waiting=%s",
+                 thread_ts, text[:80], list(pending.keys()), list(waiting.keys()))
 
     # Reply in a thread waiting for a project name (GO confirmed)
-    if thread_ts in pending:
+    if thread_ts and thread_ts in pending:
         raw = text.strip().lower()
         repo_name = re.sub(r"[^a-z0-9-]", "-", raw).strip("-")
         repo_name = re.sub(r"-{2,}", "-", repo_name)
         if not repo_name or len(repo_name) > 100:
             say(
                 "リポジトリ名が不正です。英数字とハイフンのみ・100文字以内で入力してください。\n"
-                "例: `my-app`"
+                "例: `my-app`",
+                thread_ts=thread_ts,
             )
             return
 
         info = pending.pop(thread_ts)
-        say(f"`{repo_name}` で作業を開始します！")
-
-        def post(msg: str):
-            app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=msg)
-
+        say(f"`{repo_name}` で作業を開始します！", thread_ts=thread_ts)
         threading.Thread(
             target=run_pipeline,
-            args=(repo_name, info["task"], post),
+            args=(repo_name, info["task"], channel, thread_ts),
             daemon=True,
         ).start()
         return
 
     # Reply in a thread waiting for clarification (WAIT)
-    if thread_ts in waiting:
+    if thread_ts and thread_ts in waiting:
         info = waiting[thread_ts]
         info["history"].append(text)
 
-        set_status("再評価中...")
+        ts = event["ts"]
+        try:
+            client.reactions_add(channel=channel, name="thinking_face", timestamp=ts)
+        except Exception:
+            pass
+
         judgment, result_text, task_description = reevaluate_idea(
             info["original"], info["history"]
         )
-        say(result_text)
+        say(text=result_text, thread_ts=thread_ts)
+
+        try:
+            client.reactions_remove(channel=channel, name="thinking_face", timestamp=ts)
+        except Exception:
+            pass
 
         if judgment == "GO":
             waiting.pop(thread_ts)
             pending[thread_ts] = {"task": task_description, "channel": channel}
             say(
                 "GO です！プロジェクト名を教えてください（例: `my-app`）\n"
-                "※ 英数字・ハイフンのみ"
+                "※ 英数字・ハイフンのみ",
+                thread_ts=thread_ts,
             )
         elif judgment == "REJECT":
             waiting.pop(thread_ts)
         return
 
-    # New idea — evaluate
-    set_title(text[:50])
-    set_status("アイデアを評価中...")
+    # New idea message
+    if not TRIGGER_PATTERN.search(text):
+        return
+
+    ts = event["ts"]
+    try:
+        client.reactions_add(channel=channel, name="thinking_face", timestamp=ts)
+    except Exception:
+        pass
 
     judgment, result_text, task_description = evaluate_idea(text)
-    say(result_text)
+    say(text=result_text, thread_ts=ts)
+
+    try:
+        client.reactions_remove(channel=channel, name="thinking_face", timestamp=ts)
+    except Exception:
+        pass
 
     if judgment == "GO":
-        pending[thread_ts] = {"task": task_description, "channel": channel}
+        pending[ts] = {"task": task_description, "channel": channel}
         say(
             "GO です！プロジェクト名を教えてください（例: `my-app`）\n"
-            "※ 英数字・ハイフンのみ"
+            "※ 英数字・ハイフンのみ",
+            thread_ts=ts,
         )
     elif judgment == "WAIT":
-        waiting[thread_ts] = {
+        waiting[ts] = {
             "original": text,
             "history": [],
             "channel": channel,
         }
-
-
-app.use(assistant)
-
-
-@app.event("message")
-def handle_message():
-    pass
 
 
 if __name__ == "__main__":
