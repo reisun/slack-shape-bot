@@ -8,8 +8,7 @@ services:
     volumes:
       # host workspace mounted so the bot can create project directories
       - ${HOST_WORKSPACE}:/workspace
-      # gh CLI auth (read-only)
-      - ${HOME}/.config/gh:/home/botuser/.config/gh:ro
-      # claude CLI auth
-      - ${HOME}/.claude:/home/botuser/.claude:ro
-      - ${HOME}/.claude.json:/home/botuser/.claude.json:ro
+      # auth files mounted read-only; entrypoint copies them to writable locations
+      - ${HOME}/.config/gh:/mnt/gh:ro
+      - ${HOME}/.claude:/mnt/claude:ro
+      - ${HOME}/.claude.json:/mnt/claude.json:ro
