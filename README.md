@@ -50,10 +50,11 @@ docker compose down      # 停止
 |----------|-------------|
 | `SLACK_BOT_TOKEN` | Bot User OAuth Token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | App-Level Token for Socket Mode (`xapp-...`) |
-| `ANTHROPIC_API_KEY` | Anthropic API key |
-| `GITHUB_OWNER` | GitHub ユーザー名または Org 名（default: `reisun`） |
-| `HOST_WORKSPACE` | ホスト側の workspace パス（default: `/home/reisun/workspace`） |
-| `WORKSPACE_DIR` | コンテナ内の workspace パス（default: `/workspace`） |
+| `GITHUB_OWNER` | GitHub ユーザー名または Org 名 |
+| `HOST_WORKSPACE` | ホスト側の workspace パス（絶対パス） |
+| `WORKSPACE_DIR` | コンテナ内の workspace パス（例: `/workspace`） |
+
+> `ANTHROPIC_API_KEY` は不要です。Claude の認証は `~/.claude` マウントで行われます。
 
 ## Slack App の設定
 
