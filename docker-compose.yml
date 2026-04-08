@@ -11,4 +11,3 @@ services:
       # auth files mounted read-only; entrypoint copies them to writable locations
       - ${HOME}/.config/gh:/mnt/gh:ro
       - ${HOME}/.claude:/mnt/claude:ro
-      - ${HOME}/.claude.json:/mnt/claude.json:ro
