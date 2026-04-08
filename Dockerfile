@@ -23,7 +23,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY entrypoint.sh /entrypoint.sh
 
 USER botuser
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "main.py"]
