@@ -3,3 +3,10 @@ services:
     build: .
     env_file: .env
     restart: unless-stopped
+    volumes:
+      # host workspace mounted so the bot can create project directories
+      - ${HOST_WORKSPACE:-/home/reisun/workspace}:/workspace
+      # gh CLI auth (read-only)
+      - ${HOME}/.config/gh:/root/.config/gh:ro
+      # claude CLI auth
+      - ${HOME}/.claude:/root/.claude:ro

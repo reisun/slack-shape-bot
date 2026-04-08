@@ -11,9 +11,11 @@
 - [x] .env loading (python-dotenv)
 - [x] requirements.txt
 - [x] Dockerfile + docker-compose.yml
+- [x] GO pipeline: project name prompt → repo setup → implementation → PR
 
 ## Backlog
 
 - [ ] Slack App の設定手順書（Socket Mode 有効化・権限スコープ）
-- [ ] エラー時の Slack 通知（Claude API 障害など）
-- [ ] GO 判定後の自動タスク起票連携
+- [ ] エラー時の Slack 通知の改善（Claude API 障害など）
+- [ ] WAIT / REJECT 後の再提案フロー
+- [ ] 複数チャンネル同時対応のテスト
