@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -158,18 +159,42 @@ def setup_repo(repo_name: str, task_description: str) -> Path:
     return project_dir
 
 
-def run_implementation(project_dir: Path, task_description: str) -> bool:
+def run_implementation(project_dir: Path, task_description: str,
+                       on_progress=None) -> bool:
+    """Run claude for implementation with progress reporting via on_progress callback.
+
+    on_progress(elapsed_min: int) is called periodically while claude runs.
+    No hard timeout — runs until completion.
+    """
     logger.info("[implementation] starting claude in %s", project_dir)
-    code, output = run_claude(
-        f"/direct-task {task_description}",
+    cmd = [
+        "claude", "-p", f"/direct-task {task_description}",
+        "--dangerously-skip-permissions", "--model", "sonnet",
+    ]
+    proc = subprocess.Popen(
+        cmd,
         cwd=str(project_dir),
-        timeout=900,
-        model="sonnet",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
-    logger.info("[implementation] claude finished (rc=%d), output length=%d", code, len(output))
-    logger.debug("[implementation] output: %s", output[:1000])
+
+    start = time.monotonic()
+    while proc.poll() is None:
+        time.sleep(30)
+        elapsed = int((time.monotonic() - start) / 60)
+        if on_progress and elapsed > 0:
+            on_progress(elapsed)
+
+    stdout = proc.stdout.read()
+    stderr = proc.stderr.read()
+    code = proc.returncode
+
+    logger.info("[implementation] claude finished (rc=%d, %.0fs), output length=%d",
+                code, time.monotonic() - start, len(stdout))
+    logger.debug("[implementation] output: %s", (stdout or stderr)[:1000])
     if code != 0:
-        logger.error("[implementation] claude failed (rc=%d): %s", code, output[:500])
+        logger.error("[implementation] claude failed (rc=%d): %s", code, (stdout or stderr)[:500])
     return code == 0
 
 
@@ -199,22 +224,37 @@ def create_pr(project_dir: Path, repo_name: str, task_description: str) -> str:
 
 
 def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts: str):
-    def post(msg: str):
-        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=msg)
+    def post(msg: str) -> str:
+        """Post a new message and return its ts."""
+        resp = app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=msg)
+        return resp.get("ts", "")
+
+    def update(ts: str, msg: str):
+        """Update an existing message by ts."""
+        app.client.chat_update(channel=channel, ts=ts, text=msg)
 
     try:
         post(f":hammer_and_wrench: リポジトリ `{repo_name}` を作成中...")
         project_dir = setup_repo(repo_name, task_description)
-        post(":robot_face: 実装中... しばらくお待ちください")
-        ok = run_implementation(project_dir, task_description)
-        if not ok:
-            post(":warning: 実装に失敗しましたが、PR作成を試みます")
-        post(":twisted_rightwards_arrows: PR を作成中...")
+
+        impl_ts = post(":robot_face: 実装中... しばらくお待ちください")
+
+        def on_progress(elapsed_min: int):
+            update(impl_ts, f":robot_face: 実装中... ({elapsed_min}分経過)")
+
+        ok = run_implementation(project_dir, task_description, on_progress=on_progress)
+
+        if ok:
+            update(impl_ts, ":robot_face: 実装完了")
+        else:
+            update(impl_ts, ":warning: 実装に問題がありましたが、PR作成を試みます")
+
+        pr_ts = post(":twisted_rightwards_arrows: PR を作成中...")
         pr_url = create_pr(project_dir, repo_name, task_description)
         if pr_url:
-            post(f":white_check_mark: 完了！\nPR: {pr_url}")
+            update(pr_ts, f":white_check_mark: 完了！\nPR: {pr_url}")
         else:
-            post(":warning: 完了しましたが、PR URLを取得できませんでした。GitHub を確認してください。")
+            update(pr_ts, ":warning: 完了しましたが、PR URLを取得できませんでした。GitHub を確認してください。")
     except Exception as e:
         logger.exception("[pipeline] error")
         post(f":x: エラーが発生しました:\n```{e}```")
