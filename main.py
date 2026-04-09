@@ -35,21 +35,37 @@ Slackチャンネルに投稿されるため書式に注意してください。
 
 あなたには以下の特別な能力があります:
 
-## プロジェクト作成機能
-ユーザーが何かを「作りたい」「自動化したい」といったソフトウェア開発の要望を持っていると\
-判断した場合、会話の中で自然にアイデアを評価し、以下の判定を行ってください:
+## プロジェクト作成・更新機能
+ユーザーがソフトウェア開発の要望を持っていると判断した場合、\
+会話の中で自然にアイデアを評価してください。
 
+### 新規プロジェクト
+まだ存在しないものを作りたい場合:
 - アイデアが具体的で実現可能 → 応答の末尾に **GO** マーカーを付与
-- 情報が不足していて判断できない → 追加質問をして深掘り（マーカー不要）
-- 実現が難しい・推奨できない → その旨を伝える（マーカー不要）
+- 情報が不足 → 追加質問（マーカー不要）
 
-**GO** を付ける場合、応答の最後に以下の形式でタスク記述を含めてください:
+**GO** を付ける場合:
 ```task
-（ここにタスクの具体的な記述を書く）
+（タスクの具体的な記述）
 ```
 
-この機能はあくまで会話の一部です。ユーザーが雑談や質問をしているだけなら、\
-普通に会話してください。プロジェクト作成を押し付けないでください。
+### 既存プロジェクトの更新
+既にあるリポジトリやプロジェクトを修正・機能追加したい場合:
+- 要望が具体的 → 応答の末尾に **UPDATE** マーカーを付与
+- 情報が不足 → 追加質問（マーカー不要）
+
+**UPDATE** を付ける場合:
+```task
+（変更内容の具体的な記述）
+```
+
+### 判断のポイント
+- ユーザーが「〇〇を作りたい」→ **GO**（新規）
+- ユーザーが「〇〇を修正して」「〇〇に機能追加して」「〇〇のバグを直して」→ **UPDATE**（既存）
+- ユーザーが対象のプロジェクト名/リポジトリ名に言及している場合は **UPDATE**
+- 雑談や質問なら普通に会話（マーカー不要）
+
+この機能はあくまで会話の一部です。プロジェクト作成・更新を押し付けないでください。
 
 ## コンテキスト
 応答は短めに（3-5文以内）。
@@ -83,10 +99,10 @@ def run_claude(prompt: str, cwd: str | None = None, timeout: int = 300,
     return result.returncode, output
 
 
-def chat(user_message: str) -> tuple[str, str | None]:
-    """Send a message to Claude and return (response, task_description or None).
+def chat(user_message: str) -> tuple[str, str | None, str]:
+    """Send a message to Claude and return (response, task_description or None, mode).
 
-    If response contains **GO** and a ```task block, extracts the task description.
+    mode is "new", "update", or "chat".
     """
     now = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
     prompt = f"現在時刻（日本時間）: {now}\n\nユーザー: {user_message}"
@@ -94,7 +110,14 @@ def chat(user_message: str) -> tuple[str, str | None]:
     _, output = run_claude(prompt, system_prompt=SYSTEM_PROMPT)
 
     task_description = None
-    if "**GO**" in output:
+    mode = "chat"
+
+    if "**UPDATE**" in output:
+        mode = "update"
+    elif "**GO**" in output:
+        mode = "new"
+
+    if mode in ("new", "update"):
         task_match = re.search(r"```task\s*\n(.*?)```", output, re.DOTALL)
         if task_match:
             task_description = task_match.group(1).strip()
@@ -102,8 +125,9 @@ def chat(user_message: str) -> tuple[str, str | None]:
             task_description = user_message
         # Clean markers from displayed response
         output = re.sub(r"\s*```task\s*\n.*?```", "", output, flags=re.DOTALL).strip()
+        output = output.replace("**GO**", "").replace("**UPDATE**", "").strip()
 
-    return output, task_description
+    return output, task_description, mode
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +184,25 @@ def setup_repo(repo_name: str, task_description: str) -> Path:
     return project_dir
 
 
+def setup_update(repo_name: str) -> Path:
+    """既存リポジトリを更新用にセットアップ."""
+    project_dir = WORKSPACE / repo_name
+    if not project_dir.exists():
+        raise FileNotFoundError(f"Project directory not found: {project_dir}")
+
+    cwd = str(project_dir)
+
+    # mainを最新に
+    _run_checked(["git", "checkout", "main"], cwd, "git-checkout-main")
+    _run_checked(["git", "pull", "origin", "main"], cwd, "git-pull")
+
+    # 更新用ブランチ作成（タイムスタンプ付き）
+    branch = f"feature/update-{datetime.now(ZoneInfo('Asia/Tokyo')).strftime('%Y%m%d-%H%M%S')}"
+    _run_checked(["git", "checkout", "-b", branch], cwd, "git-checkout-feature")
+
+    return project_dir
+
+
 def run_implementation(project_dir: Path, task_description: str,
                        on_progress=None) -> bool:
     """Run claude for implementation with progress reporting via on_progress callback.
@@ -199,21 +242,28 @@ def run_implementation(project_dir: Path, task_description: str,
     return code == 0
 
 
-def create_pr(project_dir: Path, repo_name: str, task_description: str) -> str:
+def create_pr(project_dir: Path, repo_name: str, task_description: str,
+              commit_msg: str = "Implement initial version",
+              pr_title: str | None = None) -> str:
     cwd = str(project_dir)
     _run_checked(["git", "add", "."], cwd, "pr-git-add")
     rc, _, _ = _run(["git", "diff", "--cached", "--quiet"], cwd)
     if rc != 0:
-        _run_checked(["git", "commit", "-m", "Implement initial version"], cwd, "pr-git-commit")
+        _run_checked(["git", "commit", "-m", commit_msg], cwd, "pr-git-commit")
     else:
         logger.warning("[pr] no changes to commit")
 
-    _run_checked(["git", "push", "-u", "origin", "feature/initial-implementation"], cwd, "pr-git-push")
+    # 現在のブランチ名を取得
+    _, branch, _ = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    branch = branch.strip()
 
+    _run_checked(["git", "push", "-u", "origin", branch], cwd, "pr-git-push")
+
+    title = pr_title or f"Implement {repo_name}"
     rc, stdout, stderr = _run_checked(
         [
             "gh", "pr", "create",
-            "--title", f"Implement {repo_name}",
+            "--title", title,
             "--body",
             f"## Summary\n\n{task_description}\n\n"
             "🤖 Generated by slack-shape-bot",
@@ -224,7 +274,8 @@ def create_pr(project_dir: Path, repo_name: str, task_description: str) -> str:
     return stdout.strip().split("\n")[-1]
 
 
-def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts: str):
+def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts: str,
+                 mode: str = "new"):
     def post(msg: str) -> str:
         """Post a new message and return its ts."""
         resp = app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=msg)
@@ -235,8 +286,12 @@ def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts:
         app.client.chat_update(channel=channel, ts=ts, text=msg)
 
     try:
-        post(f":hammer_and_wrench: リポジトリ `{repo_name}` を作成中...")
-        project_dir = setup_repo(repo_name, task_description)
+        if mode == "update":
+            post(f":wrench: リポジトリ `{repo_name}` を更新準備中...")
+            project_dir = setup_update(repo_name)
+        else:
+            post(f":hammer_and_wrench: リポジトリ `{repo_name}` を作成中...")
+            project_dir = setup_repo(repo_name, task_description)
 
         impl_ts = post(":robot_face: 実装中... しばらくお待ちください")
 
@@ -251,7 +306,12 @@ def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts:
             update(impl_ts, ":warning: 実装に問題がありましたが、PR作成を試みます")
 
         pr_ts = post(":twisted_rightwards_arrows: PR を作成中...")
-        pr_url = create_pr(project_dir, repo_name, task_description)
+        if mode == "update":
+            pr_url = create_pr(project_dir, repo_name, task_description,
+                               commit_msg="Update: " + task_description[:60],
+                               pr_title=f"Update {repo_name}")
+        else:
+            pr_url = create_pr(project_dir, repo_name, task_description)
         if pr_url:
             update(pr_ts, f":white_check_mark: 完了！\nPR: {pr_url}")
         else:
@@ -291,10 +351,14 @@ def handle_message(event, say, client):
             return
 
         info = pending.pop(thread_ts)
-        say(f"`{repo_name}` で作業を開始します！", thread_ts=thread_ts)
+        mode = info.get("mode", "new")
+        if mode == "update":
+            say(f"`{repo_name}` の更新を開始します！", thread_ts=thread_ts)
+        else:
+            say(f"`{repo_name}` で作業を開始します！", thread_ts=thread_ts)
         threading.Thread(
             target=run_pipeline,
-            args=(repo_name, info["task"], channel, thread_ts),
+            args=(repo_name, info["task"], channel, thread_ts, mode),
             daemon=True,
         ).start()
         return
@@ -309,10 +373,10 @@ def handle_message(event, say, client):
         pass
 
     try:
-        response, task_description = chat(text)
+        response, task_description, mode = chat(text)
     except Exception:
         logger.exception("Claude chat failed")
-        response, task_description = "ちょっとエラーが起きちゃった :sweat_smile: もう一度試してみて！", None
+        response, task_description, mode = "ちょっとエラーが起きちゃった :sweat_smile: もう一度試してみて！", None, "chat"
 
     say(text=response, thread_ts=reply_thread)
 
@@ -322,12 +386,19 @@ def handle_message(event, say, client):
         pass
 
     if task_description:
-        pending[reply_thread] = {"task": task_description, "channel": channel}
-        say(
-            "プロジェクト名を教えてください（例: `my-app`）\n"
-            "※ 英数字・ハイフンのみ",
-            thread_ts=reply_thread,
-        )
+        pending[reply_thread] = {"task": task_description, "channel": channel, "mode": mode}
+        if mode == "update":
+            say(
+                "更新対象のリポジトリ名を教えてください（例: `my-app`）\n"
+                "※ 英数字・ハイフンのみ",
+                thread_ts=reply_thread,
+            )
+        else:
+            say(
+                "プロジェクト名を教えてください（例: `my-app`）\n"
+                "※ 英数字・ハイフンのみ",
+                thread_ts=reply_thread,
+            )
 
 
 if __name__ == "__main__":
