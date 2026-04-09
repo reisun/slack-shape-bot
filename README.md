@@ -1,19 +1,23 @@
 # slack-shape-bot
 
-Slack bot that receives app ideas, evaluates them with shape-request logic (GO / WAIT / REJECT), and — when GO — automatically creates a GitHub repo, implements the MVP, and opens a PR.
+自宅環境でホスティングされた Claude 会話サービス。Slack チャンネルでの汎用的な会話に応答し、ソフトウェア開発の要望があれば自動でリポジトリ作成・実装・PR作成まで行う。
 
 ## Flow
 
 ```
 You (Slack)         Bot                        Workspace
 -----------         ---                        ---------
-"○○なアプリ作りたい"
-                → shape-request 評価
-                ← GO / WAIT / REJECT (thread)
-"my-app"  ←←←← (GO の場合) プロジェクト名を質問
+何でも話しかける
+                → Claude (Opus) で応答
+                ← 会話の返答 (thread)
+
+「○○を作りたい」
+                → Claude が自然に評価
+                ← **GO** + タスク記述 (thread)
+"my-app"  ←←←← プロジェクト名を質問
                 → /workspace/my-app を作成
                 → GitHub repo 作成 & push
-                → claude -p で実装
+                → Claude (Sonnet) で実装
                 → gh pr create
                 ← PR URL (thread)
 ```
@@ -22,15 +26,10 @@ You (Slack)         Bot                        Workspace
 
 - Python 3.11+
 - [slack_bolt](https://github.com/slackapi/bolt-python) (Socket Mode)
-- [anthropic](https://github.com/anthropics/anthropic-sdk-python)
-- [claude CLI](https://github.com/anthropics/claude-code) — MVP 実装に使用
+- [claude CLI](https://github.com/anthropics/claude-code) — 会話応答 (Opus) + 実装 (Sonnet)
 - Docker / docker compose
 
-## Trigger keywords
-
-`作りたい` `したい` `欲しい` `アプリ` `ツール` `bot` `システム` `サービス` `機能` `自動化`
-
-## Setup (Docker — recommended)
+## Setup (Docker)
 
 ```bash
 cp .env.example .env
@@ -54,7 +53,7 @@ docker compose down      # 停止
 | `HOST_WORKSPACE` | ホスト側の workspace パス（絶対パス） |
 | `WORKSPACE_DIR` | コンテナ内の workspace パス（例: `/workspace`） |
 
-> `ANTHROPIC_API_KEY` は不要です。Claude の認証は `~/.claude` マウントで行われます。
+> `ANTHROPIC_API_KEY` は不要です。Claude の認証はホストの `~/.claude` をシンボリックリンクで共有しています。
 
 ## Slack App の設定
 
@@ -74,5 +73,6 @@ docker compose down      # 停止
 | Host | Container | 用途 |
 |------|-----------|------|
 | `HOST_WORKSPACE` | `/workspace` | 新規プロジェクトの作成先 |
-| `~/.config/gh` | `/root/.config/gh` | gh CLI 認証 |
-| `~/.claude` | `/root/.claude` | claude CLI 認証 |
+| `~/.config/gh` | `/mnt/gh` → `$HOME/.config/gh` (symlink) | gh CLI 認証 |
+| `~/.claude` | `/mnt/claude` → `$HOME/.claude` (symlink) | Claude CLI 認証（ホストと共有） |
+| `/var/run/docker.sock` | `/var/run/docker.sock` | 他プロジェクトのデプロイ用 |
