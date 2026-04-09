@@ -11,3 +11,5 @@ services:
       # auth files mounted read-only; entrypoint copies them to writable locations
       - ${HOME}/.config/gh:/mnt/gh:ro
       - ${HOME}/.claude:/mnt/claude:ro
+      # Docker socket for container management (deploy)
+      - /var/run/docker.sock:/var/run/docker.sock
