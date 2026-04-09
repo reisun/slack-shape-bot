@@ -59,11 +59,14 @@ SYSTEM_PROMPT = """\
 # ---------------------------------------------------------------------------
 
 def run_claude(prompt: str, cwd: str | None = None, timeout: int = 300,
-               system_prompt: str | None = None) -> tuple[int, str]:
+               system_prompt: str | None = None,
+               model: str | None = None) -> tuple[int, str]:
     """Run claude -p <prompt> and return (returncode, stdout)."""
     cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
     if system_prompt:
         cmd.extend(["--system-prompt", system_prompt])
+    if model:
+        cmd.extend(["--model", model])
     result = subprocess.run(
         cmd,
         cwd=cwd or str(WORKSPACE),
@@ -161,6 +164,7 @@ def run_implementation(project_dir: Path, task_description: str) -> bool:
         f"/direct-task {task_description}",
         cwd=str(project_dir),
         timeout=900,
+        model="sonnet",
     )
     logger.info("[implementation] claude finished (rc=%d), output length=%d", code, len(output))
     logger.debug("[implementation] output: %s", output[:1000])
