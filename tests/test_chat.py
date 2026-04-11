@@ -7,7 +7,7 @@ main.py は import 時に Slack App を初期化するため、
 import re
 
 
-def _parse_chat_response(output: str, user_message: str) -> tuple[str, str | None, str | None, str]:
+def _parse_chat_response(output: str, fallback_prompt: str) -> tuple[str, str | None, str | None, str]:
     """main.chat() 内のパース処理を再現."""
     task_description = None
     repo_name = None
@@ -23,7 +23,7 @@ def _parse_chat_response(output: str, user_message: str) -> tuple[str, str | Non
         if task_match:
             task_description = task_match.group(1).strip()
         else:
-            task_description = user_message
+            task_description = fallback_prompt
 
         name_match = re.search(r"```name\s*\n(.*?)```", output, re.DOTALL)
         if name_match:
@@ -71,7 +71,7 @@ class TestChatMarkerDetection:
         assert name is None
         assert response == "こんにちは！元気ですか？"
 
-    def test_go_without_task_block_falls_back_to_user_message(self):
+    def test_go_without_task_block_falls_back_to_prompt(self):
         _, task, _, mode = _parse_chat_response(
             "やりましょう！\n```name\ncalculator\n```\n**GO**",
             "電卓作りたい",
@@ -125,7 +125,7 @@ class TestChatMarkerDetection:
 
 
 class TestRepoNameNormalization:
-    """handle_message 内のリポジトリ名正規化ロジックのテスト."""
+    """リポジトリ名正規化ロジックのテスト."""
 
     @staticmethod
     def normalize(raw: str) -> str | None:
@@ -168,22 +168,44 @@ class TestRepoNameNormalization:
         result = self.normalize("テストアプリ")
         assert result is None
 
+    def test_underscores_preserved(self):
+        assert self.normalize("discord_gamble_bot") == "discord_gamble_bot"
 
-class TestConfirmationPatterns:
-    """確認フェーズのOK/キャンセル判定テスト."""
 
-    _CONFIRM_YES = re.compile(r"^(ok|yes|はい|うん|お願い|いいよ|よろしく|やって|頼む|go|おk|おけ|いける|大丈夫|おなしゃす|y)$", re.IGNORECASE)
-    _CONFIRM_NO = re.compile(r"^(no|いいえ|やめ|キャンセル|cancel|stop|やっぱ|やだ|ストップ|なし|n)$", re.IGNORECASE)
+class TestConversationPromptBuilder:
+    """会話履歴からプロンプトを構築するテスト."""
 
-    def test_yes_patterns(self):
-        for word in ["OK", "ok", "はい", "うん", "お願い", "いいよ", "よろしく", "やって", "go", "Go", "おk", "y"]:
-            assert self._CONFIRM_YES.match(word), f"'{word}' should match YES"
+    @staticmethod
+    def _build(messages, bot_user_id=None):
+        lines = ["=== 会話履歴 ==="]
+        for msg in messages:
+            if msg.get("subtype"):
+                continue
+            text = msg.get("text", "")
+            if not text:
+                continue
+            if msg.get("bot_id") or msg.get("user") == bot_user_id:
+                lines.append(f"あなた: {text}")
+            else:
+                lines.append(f"ユーザー: {text}")
+        return "\n".join(lines)
 
-    def test_no_patterns(self):
-        for word in ["no", "いいえ", "やめ", "キャンセル", "cancel", "やっぱ", "n"]:
-            assert self._CONFIRM_NO.match(word), f"'{word}' should match NO"
+    def test_user_and_bot_messages(self):
+        messages = [
+            {"user": "U123", "text": "TODOアプリ作って"},
+            {"user": "BXYZ", "bot_id": "B001", "text": "いいですね！"},
+            {"user": "U123", "text": "React で"},
+        ]
+        result = self._build(messages)
+        assert "ユーザー: TODOアプリ作って" in result
+        assert "あなた: いいですね！" in result
+        assert "ユーザー: React で" in result
 
-    def test_unrecognized_input(self):
-        for word in ["todo-appでお願いします", "ちょっと待って", "何それ"]:
-            assert not self._CONFIRM_YES.match(word)
-            assert not self._CONFIRM_NO.match(word)
+    def test_subtypes_skipped(self):
+        messages = [
+            {"user": "U123", "text": "hello"},
+            {"user": "U123", "text": "edited", "subtype": "message_changed"},
+        ]
+        result = self._build(messages)
+        assert "hello" in result
+        assert "edited" not in result

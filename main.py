@@ -24,11 +24,8 @@ GITHUB_OWNER = os.environ["GITHUB_OWNER"]
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
-# thread_ts -> {task: str, channel: str, repo_name: str, mode: str}
-pending: dict[str, dict] = {}
-
-_CONFIRM_YES = re.compile(r"^(ok|yes|はい|うん|お願い|いいよ|よろしく|やって|頼む|go|おk|おけ|いける|大丈夫|おなしゃす|y)$", re.IGNORECASE)
-_CONFIRM_NO = re.compile(r"^(no|いいえ|やめ|キャンセル|cancel|stop|やっぱ|やだ|ストップ|なし|n)$", re.IGNORECASE)
+# Tracks threads where a pipeline is already running to avoid duplicates
+_running: set[str] = set()
 
 SYSTEM_PROMPT_TEMPLATE = """\
 あなたは自宅環境でホスティングされたClaudeの会話サービスです。
@@ -91,6 +88,33 @@ def _build_system_prompt() -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(repo_list=repo_list)
 
 
+def _fetch_thread_history(client, channel: str, thread_ts: str) -> list[dict]:
+    """Fetch conversation history for a thread via Slack API."""
+    try:
+        result = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
+        return result.get("messages", [])
+    except Exception:
+        logger.warning("Failed to fetch thread history", exc_info=True)
+        return []
+
+
+def _build_conversation_prompt(messages: list[dict], bot_user_id: str | None) -> str:
+    """Build a conversation prompt from Slack thread messages."""
+    now = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
+    lines = [f"現在時刻（日本時間）: {now}", "", "=== 会話履歴 ==="]
+    for msg in messages:
+        if msg.get("subtype"):
+            continue
+        text = msg.get("text", "")
+        if not text:
+            continue
+        if msg.get("bot_id") or msg.get("user") == bot_user_id:
+            lines.append(f"あなた: {text}")
+        else:
+            lines.append(f"ユーザー: {text}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # claude CLI helper
 # ---------------------------------------------------------------------------
@@ -118,14 +142,11 @@ def run_claude(prompt: str, cwd: str | None = None, timeout: int = 300,
     return result.returncode, output
 
 
-def chat(user_message: str) -> tuple[str, str | None, str | None, str]:
-    """Send a message to Claude and return (response, task_description, repo_name, mode).
+def chat(prompt: str) -> tuple[str, str | None, str | None, str]:
+    """Send a prompt to Claude and return (response, task_description, repo_name, mode).
 
     mode is "new", "update", or "chat".
     """
-    now = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
-    prompt = f"現在時刻（日本時間）: {now}\n\nユーザー: {user_message}"
-
     _, output = run_claude(prompt, system_prompt=_build_system_prompt())
 
     task_description = None
@@ -142,7 +163,7 @@ def chat(user_message: str) -> tuple[str, str | None, str | None, str]:
         if task_match:
             task_description = task_match.group(1).strip()
         else:
-            task_description = user_message
+            task_description = prompt
 
         name_match = re.search(r"```name\s*\n(.*?)```", output, re.DOTALL)
         if name_match:
@@ -358,6 +379,8 @@ def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts:
     except Exception as e:
         logger.exception("[pipeline] error")
         post(f":x: エラーが発生しました:\n```{e}```")
+    finally:
+        _running.discard(thread_ts)
 
 
 # ---------------------------------------------------------------------------
@@ -372,46 +395,35 @@ def handle_message(event, say, client):
     text = event.get("text", "")
     thread_ts = event.get("thread_ts")
     channel = event.get("channel", "")
-
-    logger.debug("message: thread_ts=%s text=%s pending=%s",
-                 thread_ts, text[:80], list(pending.keys()))
-
-    # Reply in a thread waiting for confirmation (OK / cancel)
-    if thread_ts and thread_ts in pending:
-        answer = text.strip()
-        if _CONFIRM_NO.match(answer):
-            pending.pop(thread_ts)
-            say("了解、キャンセルしました :+1:", thread_ts=thread_ts)
-            return
-        if not _CONFIRM_YES.match(answer):
-            say("「OK」で開始、「やめる」でキャンセルできます。", thread_ts=thread_ts)
-            return
-
-        info = pending.pop(thread_ts)
-        repo_name = info["repo_name"]
-        mode = info.get("mode", "new")
-        if mode == "update":
-            say(f"`{repo_name}` の更新を開始します！", thread_ts=thread_ts)
-        else:
-            say(f"`{repo_name}` で作業を開始します！", thread_ts=thread_ts)
-        threading.Thread(
-            target=run_pipeline,
-            args=(repo_name, info["task"], channel, thread_ts, mode),
-            daemon=True,
-        ).start()
-        return
-
-    # General conversation
     ts = event.get("ts")
     reply_thread = thread_ts or ts
+
+    # Skip if a pipeline is already running in this thread
+    if reply_thread in _running:
+        return
 
     try:
         client.reactions_add(channel=channel, name="thinking_face", timestamp=ts)
     except Exception:
         pass
 
+    # Build prompt: include thread history if available for context
+    bot_user_id = None
     try:
-        response, task_description, repo_name, mode = chat(text)
+        auth = client.auth_test()
+        bot_user_id = auth.get("user_id")
+    except Exception:
+        pass
+
+    if thread_ts:
+        messages = _fetch_thread_history(client, channel, thread_ts)
+        prompt = _build_conversation_prompt(messages, bot_user_id)
+    else:
+        now = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
+        prompt = f"現在時刻（日本時間）: {now}\n\nユーザー: {text}"
+
+    try:
+        response, task_description, repo_name, mode = chat(prompt)
     except Exception:
         logger.exception("Claude chat failed")
         response, task_description, repo_name, mode = "ちょっとエラーが起きちゃった :sweat_smile: もう一度試してみて！", None, None, "chat"
@@ -424,23 +436,12 @@ def handle_message(event, say, client):
         pass
 
     if task_description and repo_name:
-        pending[reply_thread] = {"task": task_description, "channel": channel, "mode": mode, "repo_name": repo_name}
-        if mode == "update":
-            say(
-                f"`{repo_name}` を更新します。よろしいですか？（OK / やめる）",
-                thread_ts=reply_thread,
-            )
-        else:
-            say(
-                f"`{repo_name}` を作成します。よろしいですか？（OK / やめる）",
-                thread_ts=reply_thread,
-            )
-    elif task_description:
-        # repo_name could not be determined — fall back to asking
-        say(
-            "プロジェクト名を決められませんでした。もう少し詳しく教えてもらえますか？",
-            thread_ts=reply_thread,
-        )
+        _running.add(reply_thread)
+        threading.Thread(
+            target=run_pipeline,
+            args=(repo_name, task_description, channel, reply_thread, mode),
+            daemon=True,
+        ).start()
 
 
 if __name__ == "__main__":
