@@ -24,10 +24,13 @@ GITHUB_OWNER = os.environ["GITHUB_OWNER"]
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
-# thread_ts -> {task: str, channel: str}
+# thread_ts -> {task: str, channel: str, repo_name: str, mode: str}
 pending: dict[str, dict] = {}
 
-SYSTEM_PROMPT = """\
+_CONFIRM_YES = re.compile(r"^(ok|yes|はい|うん|お願い|いいよ|よろしく|やって|頼む|go|おk|おけ|いける|大丈夫|おなしゃす|y)$", re.IGNORECASE)
+_CONFIRM_NO = re.compile(r"^(no|いいえ|やめ|キャンセル|cancel|stop|やっぱ|やだ|ストップ|なし|n)$", re.IGNORECASE)
+
+SYSTEM_PROMPT_TEMPLATE = """\
 あなたは自宅環境でホスティングされたClaudeの会話サービスです。
 ユーザーの質問や相談に自然に応じてください。
 日本語で、カジュアルな口調で応答してください。
@@ -44,7 +47,10 @@ Slackチャンネルに投稿されるため書式に注意してください。
 - アイデアが具体的で実現可能 → 応答の末尾に **GO** マーカーを付与
 - 情報が不足 → 追加質問（マーカー不要）
 
-**GO** を付ける場合:
+**GO** を付ける場合、プロジェクト名とタスクの両方を含めてください:
+```name
+（英数字・ハイフンのみのリポジトリ名。内容に合った簡潔な名前）
+```
 ```task
 （タスクの具体的な記述）
 ```
@@ -54,7 +60,10 @@ Slackチャンネルに投稿されるため書式に注意してください。
 - 要望が具体的 → 応答の末尾に **UPDATE** マーカーを付与
 - 情報が不足 → 追加質問（マーカー不要）
 
-**UPDATE** を付ける場合:
+**UPDATE** を付ける場合、対象のプロジェクト名とタスクの両方を含めてください:
+```name
+（既存リポジトリ一覧から正確な名前を選ぶこと）
+```
 ```task
 （変更内容の具体的な記述）
 ```
@@ -67,9 +76,19 @@ Slackチャンネルに投稿されるため書式に注意してください。
 
 この機能はあくまで会話の一部です。プロジェクト作成・更新を押し付けないでください。
 
+### 既存リポジトリ一覧
+{repo_list}
+
 ## コンテキスト
 応答は短めに（3-5文以内）。
 """
+
+
+def _build_system_prompt() -> str:
+    """Build system prompt with current list of existing repositories."""
+    repos = sorted(d.name for d in WORKSPACE.iterdir() if d.is_dir() and not d.name.startswith("."))
+    repo_list = ", ".join(repos) if repos else "（なし）"
+    return SYSTEM_PROMPT_TEMPLATE.format(repo_list=repo_list)
 
 
 # ---------------------------------------------------------------------------
@@ -99,17 +118,18 @@ def run_claude(prompt: str, cwd: str | None = None, timeout: int = 300,
     return result.returncode, output
 
 
-def chat(user_message: str) -> tuple[str, str | None, str]:
-    """Send a message to Claude and return (response, task_description or None, mode).
+def chat(user_message: str) -> tuple[str, str | None, str | None, str]:
+    """Send a message to Claude and return (response, task_description, repo_name, mode).
 
     mode is "new", "update", or "chat".
     """
     now = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
     prompt = f"現在時刻（日本時間）: {now}\n\nユーザー: {user_message}"
 
-    _, output = run_claude(prompt, system_prompt=SYSTEM_PROMPT)
+    _, output = run_claude(prompt, system_prompt=_build_system_prompt())
 
     task_description = None
+    repo_name = None
     mode = "chat"
 
     if "**UPDATE**" in output:
@@ -123,11 +143,21 @@ def chat(user_message: str) -> tuple[str, str | None, str]:
             task_description = task_match.group(1).strip()
         else:
             task_description = user_message
+
+        name_match = re.search(r"```name\s*\n(.*?)```", output, re.DOTALL)
+        if name_match:
+            raw = name_match.group(1).strip().lower()
+            repo_name = re.sub(r"[^a-z0-9-]", "-", raw).strip("-")
+            repo_name = re.sub(r"-{2,}", "-", repo_name)
+            if not repo_name or len(repo_name) > 100:
+                repo_name = None
+
         # Clean markers from displayed response
         output = re.sub(r"\s*```task\s*\n.*?```", "", output, flags=re.DOTALL).strip()
+        output = re.sub(r"\s*```name\s*\n.*?```", "", output, flags=re.DOTALL).strip()
         output = output.replace("**GO**", "").replace("**UPDATE**", "").strip()
 
-    return output, task_description, mode
+    return output, task_description, repo_name, mode
 
 
 # ---------------------------------------------------------------------------
@@ -337,20 +367,19 @@ def handle_message(event, say, client):
     logger.debug("message: thread_ts=%s text=%s pending=%s",
                  thread_ts, text[:80], list(pending.keys()))
 
-    # Reply in a thread waiting for a project name (GO confirmed)
+    # Reply in a thread waiting for confirmation (OK / cancel)
     if thread_ts and thread_ts in pending:
-        raw = text.strip().lower()
-        repo_name = re.sub(r"[^a-z0-9-]", "-", raw).strip("-")
-        repo_name = re.sub(r"-{2,}", "-", repo_name)
-        if not repo_name or len(repo_name) > 100:
-            say(
-                "リポジトリ名が不正です。英数字とハイフンのみ・100文字以内で入力してください。\n"
-                "例: `my-app`",
-                thread_ts=thread_ts,
-            )
+        answer = text.strip()
+        if _CONFIRM_NO.match(answer):
+            pending.pop(thread_ts)
+            say("了解、キャンセルしました :+1:", thread_ts=thread_ts)
+            return
+        if not _CONFIRM_YES.match(answer):
+            say("「OK」で開始、「やめる」でキャンセルできます。", thread_ts=thread_ts)
             return
 
         info = pending.pop(thread_ts)
+        repo_name = info["repo_name"]
         mode = info.get("mode", "new")
         if mode == "update":
             say(f"`{repo_name}` の更新を開始します！", thread_ts=thread_ts)
@@ -373,10 +402,10 @@ def handle_message(event, say, client):
         pass
 
     try:
-        response, task_description, mode = chat(text)
+        response, task_description, repo_name, mode = chat(text)
     except Exception:
         logger.exception("Claude chat failed")
-        response, task_description, mode = "ちょっとエラーが起きちゃった :sweat_smile: もう一度試してみて！", None, "chat"
+        response, task_description, repo_name, mode = "ちょっとエラーが起きちゃった :sweat_smile: もう一度試してみて！", None, None, "chat"
 
     say(text=response, thread_ts=reply_thread)
 
@@ -385,20 +414,24 @@ def handle_message(event, say, client):
     except Exception:
         pass
 
-    if task_description:
-        pending[reply_thread] = {"task": task_description, "channel": channel, "mode": mode}
+    if task_description and repo_name:
+        pending[reply_thread] = {"task": task_description, "channel": channel, "mode": mode, "repo_name": repo_name}
         if mode == "update":
             say(
-                "更新対象のリポジトリ名を教えてください（例: `my-app`）\n"
-                "※ 英数字・ハイフンのみ",
+                f"`{repo_name}` を更新します。よろしいですか？（OK / やめる）",
                 thread_ts=reply_thread,
             )
         else:
             say(
-                "プロジェクト名を教えてください（例: `my-app`）\n"
-                "※ 英数字・ハイフンのみ",
+                f"`{repo_name}` を作成します。よろしいですか？（OK / やめる）",
                 thread_ts=reply_thread,
             )
+    elif task_description:
+        # repo_name could not be determined — fall back to asking
+        say(
+            "プロジェクト名を決められませんでした。もう少し詳しく教えてもらえますか？",
+            thread_ts=reply_thread,
+        )
 
 
 if __name__ == "__main__":
