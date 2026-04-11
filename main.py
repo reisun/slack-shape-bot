@@ -353,13 +353,16 @@ def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts:
         """Update an existing message by ts."""
         app.client.chat_update(channel=channel, ts=ts, text=msg)
 
+    results = []
     try:
         if mode == "update":
-            post(f":wrench: リポジトリ `{repo_name}` を更新準備中...")
+            post(f":wrench: `{repo_name}` の更新を開始します...")
             project_dir = setup_update(repo_name)
+            results.append(f"リポジトリ {repo_name} の更新用ブランチを作成しました。")
         else:
-            post(f":hammer_and_wrench: リポジトリ `{repo_name}` を作成中...")
+            post(f":hammer_and_wrench: `{repo_name}` の作成を開始します...")
             project_dir = setup_repo(repo_name, task_description)
+            results.append(f"リポジトリ {repo_name} を作成しました。")
 
         impl_ts = post(":robot_face: 実装中... しばらくお待ちください")
 
@@ -367,28 +370,31 @@ def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts:
             update(impl_ts, f":robot_face: 実装中... ({elapsed_min}分経過)")
 
         ok = run_implementation(project_dir, task_description, on_progress=on_progress)
+        update(impl_ts, ":robot_face: 実装完了")
+        results.append(f"実装の終了コード: {'成功' if ok else '失敗'}")
 
-        if ok:
-            update(impl_ts, ":robot_face: 実装完了")
-        else:
-            update(impl_ts, ":warning: 実装に問題がありましたが、PR作成を試みます")
-
-        pr_ts = post(":twisted_rightwards_arrows: PR を作成中...")
         if mode == "update":
             pr_url = create_pr(project_dir, repo_name, task_description,
                                commit_msg="Update: " + task_description[:60],
                                pr_title=f"Update {repo_name}")
         else:
             pr_url = create_pr(project_dir, repo_name, task_description)
-        if pr_url:
-            update(pr_ts, f":white_check_mark: 完了！\nPR: {pr_url}")
-        else:
-            update(pr_ts, ":warning: 完了しましたが、PR URLを取得できませんでした。GitHub を確認してください。")
+        results.append(f"PR URL: {pr_url}" if pr_url else "PR の作成に失敗、または変更なし。")
+
     except Exception as e:
         logger.exception("[pipeline] error")
-        post(f":x: エラーが発生しました:\n```{e}```")
+        results.append(f"エラー: {e}")
     finally:
         _running.discard(thread_ts)
+
+    # Let Claude summarize the results naturally
+    summary_prompt = (
+        f"以下はプロジェクト「{repo_name}」の{'更新' if mode == 'update' else '作成'}パイプラインの実行結果です。\n"
+        f"ユーザーにわかりやすく結果を報告してください。\n\n"
+        + "\n".join(f"- {r}" for r in results)
+    )
+    _, summary = run_claude(summary_prompt, system_prompt=_build_system_prompt())
+    post(summary)
 
 
 # ---------------------------------------------------------------------------
