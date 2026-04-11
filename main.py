@@ -146,11 +146,20 @@ def chat(user_message: str) -> tuple[str, str | None, str | None, str]:
 
         name_match = re.search(r"```name\s*\n(.*?)```", output, re.DOTALL)
         if name_match:
-            raw = name_match.group(1).strip().lower()
-            repo_name = re.sub(r"[^a-z0-9-]", "-", raw).strip("-")
-            repo_name = re.sub(r"-{2,}", "-", repo_name)
-            if not repo_name or len(repo_name) > 100:
-                repo_name = None
+            raw = name_match.group(1).strip()
+            # For updates, try to match an existing directory name exactly
+            if mode == "update":
+                existing = {d.name for d in WORKSPACE.iterdir() if d.is_dir() and not d.name.startswith(".")}
+                if raw in existing:
+                    repo_name = raw
+                elif raw.lower() in {n.lower() for n in existing}:
+                    repo_name = next(n for n in existing if n.lower() == raw.lower())
+            # For new projects or if no exact match found, normalize
+            if repo_name is None:
+                normalized = re.sub(r"[^a-z0-9_-]", "-", raw.lower()).strip("-")
+                normalized = re.sub(r"-{2,}", "-", normalized)
+                if normalized and len(normalized) <= 100:
+                    repo_name = normalized
 
         # Clean markers from displayed response
         output = re.sub(r"\s*```task\s*\n.*?```", "", output, flags=re.DOTALL).strip()

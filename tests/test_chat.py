@@ -28,7 +28,7 @@ def _parse_chat_response(output: str, user_message: str) -> tuple[str, str | Non
         name_match = re.search(r"```name\s*\n(.*?)```", output, re.DOTALL)
         if name_match:
             raw = name_match.group(1).strip().lower()
-            repo_name = re.sub(r"[^a-z0-9-]", "-", raw).strip("-")
+            repo_name = re.sub(r"[^a-z0-9_-]", "-", raw).strip("-")
             repo_name = re.sub(r"-{2,}", "-", repo_name)
             if not repo_name or len(repo_name) > 100:
                 repo_name = None
@@ -131,7 +131,7 @@ class TestRepoNameNormalization:
     def normalize(raw: str) -> str | None:
         """name ブロックの正規化ロジックを再現."""
         raw = raw.strip().lower()
-        repo_name = re.sub(r"[^a-z0-9-]", "-", raw).strip("-")
+        repo_name = re.sub(r"[^a-z0-9_-]", "-", raw).strip("-")
         repo_name = re.sub(r"-{2,}", "-", repo_name)
         if not repo_name or len(repo_name) > 100:
             return None
@@ -147,7 +147,7 @@ class TestRepoNameNormalization:
         assert self.normalize("my cool app") == "my-cool-app"
 
     def test_special_chars_replaced(self):
-        assert self.normalize("my_app!v2") == "my-app-v2"
+        assert self.normalize("my_app!v2") == "my_app-v2"
 
     def test_consecutive_hyphens_collapsed(self):
         assert self.normalize("my---app") == "my-app"
