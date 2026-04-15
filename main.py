@@ -129,33 +129,48 @@ def _build_conversation_prompt(messages: list[dict], bot_user_id: str | None) ->
 
 def run_claude(prompt: str, cwd: str | None = None, timeout: int = 300,
                system_prompt: str | None = None,
-               model: str | None = None) -> tuple[int, str]:
-    """Run claude -p <prompt> and return (returncode, stdout)."""
+               model: str | None = None,
+               on_progress=None) -> tuple[int, str]:
+    """Run claude -p <prompt> and return (returncode, stdout).
+
+    on_progress(elapsed_sec: int) is called periodically while claude runs.
+    """
     cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
     if system_prompt:
         cmd.extend(["--system-prompt", system_prompt])
     if model:
         cmd.extend(["--model", model])
-    result = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         cwd=cwd or str(WORKSPACE),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
     )
-    output = result.stdout.strip()
-    if not output and result.stderr.strip():
-        logger.warning("claude stderr: %s", result.stderr.strip()[:500])
-        output = result.stderr.strip()
-    return result.returncode, output
+    start = time.monotonic()
+    while proc.poll() is None:
+        time.sleep(5)
+        elapsed = int(time.monotonic() - start)
+        if timeout and elapsed > timeout:
+            proc.kill()
+            break
+        if on_progress and elapsed >= 10:
+            on_progress(elapsed)
+    stdout = (proc.stdout.read() if proc.stdout else "").strip()
+    stderr = (proc.stderr.read() if proc.stderr else "").strip()
+    output = stdout
+    if not output and stderr:
+        logger.warning("claude stderr: %s", stderr[:500])
+        output = stderr
+    return proc.returncode, output
 
 
-def chat(prompt: str) -> tuple[str, str | None, str | None, str]:
+def chat(prompt: str, on_progress=None) -> tuple[str, str | None, str | None, str]:
     """Send a prompt to Claude and return (response, task_description, repo_name, mode).
 
     mode is "new", "update", or "chat".
     """
-    _, output = run_claude(prompt, system_prompt=_build_system_prompt())
+    _, output = run_claude(prompt, system_prompt=_build_system_prompt(), on_progress=on_progress)
 
     task_description = None
     repo_name = None
@@ -401,6 +416,64 @@ def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts:
 # Slack event handler
 # ---------------------------------------------------------------------------
 
+def _respond_with_progress(channel: str, reply_thread: str, text: str, thread_ts: str | None):
+    """Post a placeholder message, update it with Claude's response, then launch the pipeline."""
+    resp = app.client.chat_postMessage(
+        channel=channel,
+        thread_ts=reply_thread,
+        text=":thinking_face: 考え中...",
+    )
+    status_ts = resp.get("ts", "")
+
+    def on_progress(elapsed_sec: int):
+        elapsed_min = elapsed_sec // 60
+        elapsed_remaining = elapsed_sec % 60
+        if elapsed_min > 0:
+            time_str = f"{elapsed_min}分{elapsed_remaining}秒"
+        else:
+            time_str = f"{elapsed_sec}秒"
+        try:
+            app.client.chat_update(
+                channel=channel, ts=status_ts,
+                text=f":thinking_face: 考え中... ({time_str}経過)",
+            )
+        except Exception:
+            logger.warning("Failed to update progress message", exc_info=True)
+
+    bot_user_id = None
+    try:
+        auth = app.client.auth_test()
+        bot_user_id = auth.get("user_id")
+    except Exception:
+        pass
+
+    if thread_ts:
+        messages = _fetch_thread_history(app.client, channel, thread_ts)
+        prompt = _build_conversation_prompt(messages, bot_user_id)
+    else:
+        now = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
+        prompt = f"現在時刻（日本時間）: {now}\n\nユーザー: {text}"
+
+    try:
+        response, task_description, repo_name, mode = chat(prompt, on_progress=on_progress)
+    except Exception:
+        logger.exception("Claude chat failed")
+        response, task_description, repo_name, mode = "ちょっとエラーが起きちゃった :sweat_smile: もう一度試してみて！", None, None, "chat"
+
+    try:
+        app.client.chat_update(channel=channel, ts=status_ts, text=response)
+    except Exception:
+        logger.exception("Failed to update final message")
+
+    if task_description and repo_name:
+        _running.add(reply_thread)
+        threading.Thread(
+            target=run_pipeline,
+            args=(repo_name, task_description, channel, reply_thread, mode),
+            daemon=True,
+        ).start()
+
+
 @app.event("message")
 def handle_message(event, say, client):
     if event.get("bot_id") or event.get("subtype"):
@@ -416,46 +489,11 @@ def handle_message(event, say, client):
     if reply_thread in _running:
         return
 
-    try:
-        client.reactions_add(channel=channel, name="thinking_face", timestamp=ts)
-    except Exception:
-        pass
-
-    # Build prompt: include thread history if available for context
-    bot_user_id = None
-    try:
-        auth = client.auth_test()
-        bot_user_id = auth.get("user_id")
-    except Exception:
-        pass
-
-    if thread_ts:
-        messages = _fetch_thread_history(client, channel, thread_ts)
-        prompt = _build_conversation_prompt(messages, bot_user_id)
-    else:
-        now = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
-        prompt = f"現在時刻（日本時間）: {now}\n\nユーザー: {text}"
-
-    try:
-        response, task_description, repo_name, mode = chat(prompt)
-    except Exception:
-        logger.exception("Claude chat failed")
-        response, task_description, repo_name, mode = "ちょっとエラーが起きちゃった :sweat_smile: もう一度試してみて！", None, None, "chat"
-
-    say(text=response, thread_ts=reply_thread)
-
-    try:
-        client.reactions_remove(channel=channel, name="thinking_face", timestamp=ts)
-    except Exception:
-        pass
-
-    if task_description and repo_name:
-        _running.add(reply_thread)
-        threading.Thread(
-            target=run_pipeline,
-            args=(repo_name, task_description, channel, reply_thread, mode),
-            daemon=True,
-        ).start()
+    threading.Thread(
+        target=_respond_with_progress,
+        args=(channel, reply_thread, text, thread_ts),
+        daemon=True,
+    ).start()
 
 
 if __name__ == "__main__":
