@@ -21,11 +21,116 @@ logger = logging.getLogger(__name__)
 
 WORKSPACE = Path(os.environ["WORKSPACE_DIR"])
 GITHUB_OWNER = os.environ["GITHUB_OWNER"]
+NOTIFY_CHANNEL = os.environ.get("SLACK_NOTIFY_CHANNEL", "")
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 # Tracks threads where a pipeline is already running to avoid duplicates
 _running: set[str] = set()
+
+# ---------------------------------------------------------------------------
+# Claude auth management
+# ---------------------------------------------------------------------------
+
+_auth_lock = threading.Lock()
+_AUTH_LOGIN_TIMEOUT = 300  # 5 minutes
+
+
+def _notify_channel() -> str:
+    """Return the channel ID for auth notifications (lazy-resolved)."""
+    global NOTIFY_CHANNEL
+    if NOTIFY_CHANNEL:
+        return NOTIFY_CHANNEL
+    # Fall back: pick the first channel the bot is in
+    try:
+        resp = app.client.conversations_list(types="public_channel,private_channel", limit=100)
+        for ch in resp.get("channels", []):
+            if ch.get("is_member"):
+                NOTIFY_CHANNEL = ch["id"]
+                return NOTIFY_CHANNEL
+    except Exception:
+        logger.warning("[auth] Failed to resolve notify channel", exc_info=True)
+    return ""
+
+
+def _is_auth_error(output: str) -> bool:
+    return ("authentication_error" in output
+            or "Invalid authentication credentials" in output)
+
+
+def _slack_notify(text: str):
+    ch = _notify_channel()
+    if not ch:
+        return
+    try:
+        app.client.chat_postMessage(channel=ch, text=text)
+    except Exception:
+        logger.warning("[auth] Failed to send notification", exc_info=True)
+
+
+def _run_auth_login() -> bool:
+    """Start ``claude auth login``, post the URL to Slack, wait for the user."""
+    logger.info("[auth] Starting claude auth login flow")
+    proc = subprocess.Popen(
+        ["claude", "auth", "login"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    url = None
+    start = time.monotonic()
+    while time.monotonic() - start < 15:
+        line = proc.stdout.readline()
+        if not line:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+            continue
+        match = re.search(r"https://claude\.com\S+", line)
+        if match:
+            url = match.group(0)
+            break
+
+    if not url:
+        logger.error("[auth] Could not extract auth URL")
+        proc.kill()
+        return False
+
+    _slack_notify(
+        ":key: *Claude の認証が切れました*\n"
+        "以下のURLをブラウザで開いて再認証してください（5分以内）:\n"
+        f"{url}"
+    )
+
+    start = time.monotonic()
+    while proc.poll() is None:
+        if time.monotonic() - start > _AUTH_LOGIN_TIMEOUT:
+            proc.kill()
+            logger.error("[auth] Timed out waiting for authentication")
+            _slack_notify(":x: 認証がタイムアウトしました（5分経過）。次回のメッセージで再試行します。")
+            return False
+        time.sleep(2)
+
+    if proc.returncode == 0:
+        logger.info("[auth] Authentication succeeded")
+        _slack_notify(":white_check_mark: 認証が完了しました！")
+        return True
+
+    logger.error("[auth] Authentication failed (rc=%d)", proc.returncode)
+    _slack_notify(":x: 認証に失敗しました。")
+    return False
+
+
+def ensure_auth() -> bool:
+    """Try to restore Claude authentication. Thread-safe."""
+    acquired = _auth_lock.acquire(timeout=_AUTH_LOGIN_TIMEOUT + 30)
+    if not acquired:
+        return False
+    try:
+        return _run_auth_login()
+    finally:
+        _auth_lock.release()
 
 SYSTEM_PROMPT_TEMPLATE = """\
 あなたは自宅環境でホスティングされたClaudeの会話サービスです。
@@ -130,10 +235,13 @@ def _build_conversation_prompt(messages: list[dict], bot_user_id: str | None) ->
 def run_claude(prompt: str, cwd: str | None = None, timeout: int = 300,
                system_prompt: str | None = None,
                model: str | None = None,
-               on_progress=None) -> tuple[int, str]:
+               on_progress=None,
+               _allow_reauth: bool = True) -> tuple[int, str]:
     """Run claude -p <prompt> and return (returncode, stdout).
 
     on_progress(elapsed_sec: int) is called periodically while claude runs.
+    If an auth error is detected and _allow_reauth is True, triggers the
+    interactive re-auth flow via Slack and retries once.
     """
     cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
     if system_prompt:
@@ -162,6 +270,14 @@ def run_claude(prompt: str, cwd: str | None = None, timeout: int = 300,
     if not output and stderr:
         logger.warning("claude stderr: %s", stderr[:500])
         output = stderr
+
+    if _allow_reauth and _is_auth_error(output):
+        logger.warning("[auth] Detected auth error, attempting re-authentication")
+        if ensure_auth():
+            return run_claude(prompt, cwd=cwd, timeout=timeout,
+                              system_prompt=system_prompt, model=model,
+                              on_progress=on_progress, _allow_reauth=False)
+
     return proc.returncode, output
 
 
@@ -292,37 +408,47 @@ def run_implementation(project_dir: Path, task_description: str,
 
     on_progress(elapsed_min: int) is called periodically while claude runs.
     No hard timeout — runs until completion.
+    If an auth error is detected, triggers re-auth and retries once.
     """
-    logger.info("[implementation] starting claude in %s", project_dir)
-    cmd = [
-        "claude", "-p", f"/direct-task {task_description}",
-        "--dangerously-skip-permissions", "--model", "sonnet",
-    ]
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(project_dir),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    for attempt in range(2):
+        logger.info("[implementation] starting claude in %s (attempt %d)", project_dir, attempt + 1)
+        cmd = [
+            "claude", "-p", f"/direct-task {task_description}",
+            "--dangerously-skip-permissions", "--model", "sonnet",
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(project_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
-    start = time.monotonic()
-    while proc.poll() is None:
-        time.sleep(30)
-        elapsed = int((time.monotonic() - start) / 60)
-        if on_progress and elapsed > 0:
-            on_progress(elapsed)
+        start = time.monotonic()
+        while proc.poll() is None:
+            time.sleep(30)
+            elapsed = int((time.monotonic() - start) / 60)
+            if on_progress and elapsed > 0:
+                on_progress(elapsed)
 
-    stdout = proc.stdout.read()
-    stderr = proc.stderr.read()
-    code = proc.returncode
+        stdout = proc.stdout.read()
+        stderr = proc.stderr.read()
+        code = proc.returncode
 
-    logger.info("[implementation] claude finished (rc=%d, %.0fs), output length=%d",
-                code, time.monotonic() - start, len(stdout))
-    logger.debug("[implementation] output: %s", (stdout or stderr)[:1000])
-    if code != 0:
-        logger.error("[implementation] claude failed (rc=%d): %s", code, (stdout or stderr)[:500])
-    return code == 0
+        logger.info("[implementation] claude finished (rc=%d, %.0fs), output length=%d",
+                    code, time.monotonic() - start, len(stdout))
+        logger.debug("[implementation] output: %s", (stdout or stderr)[:1000])
+
+        output = stdout or stderr
+        if attempt == 0 and _is_auth_error(output):
+            logger.warning("[auth] Auth error during implementation, attempting re-auth")
+            if ensure_auth():
+                continue
+        if code != 0:
+            logger.error("[implementation] claude failed (rc=%d): %s", code, output[:500])
+        return code == 0
+
+    return False
 
 
 def create_pr(project_dir: Path, repo_name: str, task_description: str,
