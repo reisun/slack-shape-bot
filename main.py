@@ -232,7 +232,7 @@ def _build_conversation_prompt(messages: list[dict], bot_user_id: str | None) ->
 # claude CLI helper
 # ---------------------------------------------------------------------------
 
-def run_claude(prompt: str, cwd: str | None = None, timeout: int = 300,
+def run_claude(prompt: str, cwd: str | None = None, timeout: int = 1800,
                system_prompt: str | None = None,
                model: str | None = None,
                on_progress=None,
@@ -407,9 +407,10 @@ def run_implementation(project_dir: Path, task_description: str,
     """Run claude for implementation with progress reporting via on_progress callback.
 
     on_progress(elapsed_min: int) is called periodically while claude runs.
-    No hard timeout — runs until completion.
+    Timeout: 30 minutes.
     If an auth error is detected, triggers re-auth and retries once.
     """
+    timeout = 1800
     for attempt in range(2):
         logger.info("[implementation] starting claude in %s (attempt %d)", project_dir, attempt + 1)
         cmd = [
@@ -427,9 +428,13 @@ def run_implementation(project_dir: Path, task_description: str,
         start = time.monotonic()
         while proc.poll() is None:
             time.sleep(30)
-            elapsed = int((time.monotonic() - start) / 60)
-            if on_progress and elapsed > 0:
-                on_progress(elapsed)
+            elapsed_sec = int(time.monotonic() - start)
+            elapsed_min = elapsed_sec // 60
+            if timeout and elapsed_sec > timeout:
+                proc.kill()
+                break
+            if on_progress and elapsed_min > 0:
+                on_progress(elapsed_min)
 
         stdout = proc.stdout.read()
         stderr = proc.stderr.read()
