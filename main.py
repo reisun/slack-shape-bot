@@ -1,6 +1,8 @@
 import logging
 import os
+import pty
 import re
+import select
 import threading
 import subprocess
 import time
@@ -81,37 +83,45 @@ def submit_auth_code(code: str) -> bool:
 
 
 def _run_auth_login() -> bool:
-    """Start ``claude auth login``, post the URL to Slack, wait for the user."""
+    """Start ``claude auth login`` with a pty, post the URL to Slack, wait for the user."""
     global _auth_code_value
     _auth_code_event.clear()
     _auth_code_value = None
 
     logger.info("[auth] Starting claude auth login flow")
+
+    master_fd, slave_fd = pty.openpty()
     proc = subprocess.Popen(
         ["claude", "auth", "login"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
     )
+    os.close(slave_fd)
 
     url = None
+    buf = b""
     start = time.monotonic()
     while time.monotonic() - start < 15:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
+        ready, _, _ = select.select([master_fd], [], [], 0.5)
+        if ready:
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
                 break
-            time.sleep(0.1)
-            continue
-        match = re.search(r"https://claude\.com\S+", line)
-        if match:
-            url = match.group(0)
+            buf += chunk
+            text = buf.decode("utf-8", errors="replace")
+            match = re.search(r"https://claude\.com\S+", text)
+            if match:
+                url = match.group(0)
+                break
+        if proc.poll() is not None:
             break
 
     if not url:
         logger.error("[auth] Could not extract auth URL")
         proc.kill()
+        os.close(master_fd)
         return False
 
     _slack_notify(
@@ -122,14 +132,15 @@ def _run_auth_login() -> bool:
 
     if _auth_code_event.wait(timeout=_AUTH_LOGIN_TIMEOUT):
         code = _auth_code_value
-        if code and proc.stdin:
+        if code:
             try:
-                proc.stdin.write(code + "\n")
-                proc.stdin.flush()
+                os.write(master_fd, (code + "\n").encode())
+                logger.info("[auth] Auth code written to pty")
             except OSError:
-                logger.warning("[auth] Failed to write auth code to stdin")
+                logger.warning("[auth] Failed to write auth code to pty")
     else:
         proc.kill()
+        os.close(master_fd)
         logger.error("[auth] Timed out waiting for authentication")
         _slack_notify(":x: 認証がタイムアウトしました（5分経過）。次回のメッセージで再試行します。")
         return False
@@ -141,12 +152,14 @@ def _run_auth_login() -> bool:
             break
         time.sleep(1)
 
+    os.close(master_fd)
+
     if proc.returncode == 0:
         logger.info("[auth] Authentication succeeded")
         _slack_notify(":white_check_mark: 認証が完了しました！")
         return True
 
-    logger.error("[auth] Authentication failed (rc=%d)", proc.returncode)
+    logger.error("[auth] Authentication failed (rc=%s)", proc.returncode)
     _slack_notify(":x: 認証に失敗しました。")
     return False
 
