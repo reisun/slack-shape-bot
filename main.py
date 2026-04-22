@@ -34,6 +34,8 @@ _running: set[str] = set()
 
 _auth_lock = threading.Lock()
 _AUTH_LOGIN_TIMEOUT = 300  # 5 minutes
+_auth_code_event = threading.Event()
+_auth_code_value: str | None = None
 
 
 def _notify_channel() -> str:
@@ -68,11 +70,26 @@ def _slack_notify(text: str):
         logger.warning("[auth] Failed to send notification", exc_info=True)
 
 
+def submit_auth_code(code: str) -> bool:
+    """Submit an auth code received from Slack to the pending auth flow."""
+    global _auth_code_value
+    if not _auth_lock.locked():
+        return False
+    _auth_code_value = code.strip()
+    _auth_code_event.set()
+    return True
+
+
 def _run_auth_login() -> bool:
     """Start ``claude auth login``, post the URL to Slack, wait for the user."""
+    global _auth_code_value
+    _auth_code_event.clear()
+    _auth_code_value = None
+
     logger.info("[auth] Starting claude auth login flow")
     proc = subprocess.Popen(
         ["claude", "auth", "login"],
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -99,18 +116,30 @@ def _run_auth_login() -> bool:
 
     _slack_notify(
         ":key: *Claude の認証が切れました*\n"
-        "以下のURLをブラウザで開いて再認証してください（5分以内）:\n"
-        f"{url}"
+        f"<{url}|こちらをクリックして再認証> してください（5分以内）。\n"
+        "認証後にコードが表示されたら、このチャンネルにそのコードを貼り付けてください。"
     )
+
+    if _auth_code_event.wait(timeout=_AUTH_LOGIN_TIMEOUT):
+        code = _auth_code_value
+        if code and proc.stdin:
+            try:
+                proc.stdin.write(code + "\n")
+                proc.stdin.flush()
+            except OSError:
+                logger.warning("[auth] Failed to write auth code to stdin")
+    else:
+        proc.kill()
+        logger.error("[auth] Timed out waiting for authentication")
+        _slack_notify(":x: 認証がタイムアウトしました（5分経過）。次回のメッセージで再試行します。")
+        return False
 
     start = time.monotonic()
     while proc.poll() is None:
-        if time.monotonic() - start > _AUTH_LOGIN_TIMEOUT:
+        if time.monotonic() - start > 30:
             proc.kill()
-            logger.error("[auth] Timed out waiting for authentication")
-            _slack_notify(":x: 認証がタイムアウトしました（5分経過）。次回のメッセージで再試行します。")
-            return False
-        time.sleep(2)
+            break
+        time.sleep(1)
 
     if proc.returncode == 0:
         logger.info("[auth] Authentication succeeded")
@@ -610,11 +639,16 @@ def handle_message(event, say, client):
     if event.get("bot_id") or event.get("subtype"):
         return
 
-    text = event.get("text", "")
+    text = event.get("text", "").strip()
     thread_ts = event.get("thread_ts")
     channel = event.get("channel", "")
     ts = event.get("ts")
     reply_thread = thread_ts or ts
+
+    if _auth_lock.locked() and text and not _auth_code_event.is_set():
+        if submit_auth_code(text):
+            logger.info("[auth] Auth code received from Slack")
+            return
 
     # Skip if a pipeline is already running in this thread
     if reply_thread in _running:
