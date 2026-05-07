@@ -10,6 +10,12 @@ services:
       - ${HOST_WORKSPACE}:/workspace
       # auth files shared with host (rw so token refresh propagates)
       - ${HOME}/.config/gh:/mnt/gh
-      - ${HOME}/.claude:/mnt/claude
       # Docker socket for container management (deploy)
       - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - default
+      - llm-network
+
+networks:
+  llm-network:
+    external: true
