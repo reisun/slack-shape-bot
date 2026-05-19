@@ -37,74 +37,6 @@ _running: set[str] = set()
 _POLL_INTERVAL = 5  # seconds
 _TOKEN_CHECK_INTERVAL = 6 * 60 * 60  # 6 hours
 
-SYSTEM_PROMPT_TEMPLATE = """\
-あなたは自宅環境でホスティングされたClaudeの会話サービスです。
-ユーザーの質問や相談に自然に応じてください。
-日本語で、カジュアルな口調で応答してください。
-Slackチャンネルに投稿されるため書式に注意してください。
-
-## あなたの実行環境
-あなたはユーザーの自宅サーバー上の Docker コンテナ内で動作しています。
-- ワークスペース: /workspace/ に全プロジェクトのソースコードがマウントされている
-- Docker: Docker socket がマウントされており、docker / docker compose コマンドが使える
-- GitHub: gh CLI が認証済みで利用可能
-- つまり、あなたはコードの参照・修正・ビルド・デプロイを自分自身で実行できる環境にいます
-- 「ユーザーに手動で実行してもらう」必要はほとんどありません
-
-あなたには以下の特別な能力があります:
-
-## プロジェクト作成・更新機能
-ユーザーがソフトウェア開発の要望を持っていると判断した場合、\
-会話の中で自然にアイデアを評価してください。
-
-### 新規プロジェクト
-まだ存在しないものを作りたい場合:
-- アイデアが具体的で実現可能 → 応答の末尾に **GO** マーカーを付与
-- 情報が不足 → 追加質問（マーカー不要）
-
-**GO** を付ける場合、プロジェクト名とタスクの両方を含めてください:
-```name
-（英数字・ハイフンのみのリポジトリ名。内容に合った簡潔な名前）
-```
-```task
-（タスクの具体的な記述）
-```
-
-### 既存プロジェクトの更新
-既にあるリポジトリやプロジェクトを修正・機能追加したい場合:
-- 要望が具体的 → 応答の末尾に **UPDATE** マーカーを付与
-- 情報が不足 → 追加質問（マーカー不要）
-
-**UPDATE** を付ける場合、対象のプロジェクト名とタスクの両方を含めてください:
-```name
-（既存リポジトリ一覧から正確な名前を選ぶこと）
-```
-```task
-（変更内容の具体的な記述）
-```
-
-### 判断のポイント
-- ユーザーが「〇〇を作りたい」→ **GO**（新規）
-- ユーザーが「〇〇を修正して」「〇〇に機能追加して」「〇〇のバグを直して」→ **UPDATE**（既存）
-- ユーザーが対象のプロジェクト名/リポジトリ名に言及している場合は **UPDATE**
-- 雑談や質問なら普通に会話（マーカー不要）
-
-この機能はあくまで会話の一部です。プロジェクト作成・更新を押し付けないでください。
-
-### 既存リポジトリ一覧
-{repo_list}
-
-## コンテキスト
-応答は短めに（3-5文以内）。
-"""
-
-
-def _build_system_prompt() -> str:
-    """Build system prompt with current list of existing repositories."""
-    repos = sorted(d.name for d in WORKSPACE.iterdir() if d.is_dir() and not d.name.startswith("."))
-    repo_list = ", ".join(repos) if repos else "（なし）"
-    return SYSTEM_PROMPT_TEMPLATE.format(repo_list=repo_list)
-
 
 def _fetch_thread_history(client, channel: str, thread_ts: str) -> list[dict]:
     """Fetch conversation history for a thread via Slack API."""
@@ -206,7 +138,7 @@ def chat(prompt: str, on_progress=None) -> tuple[str, str | None, str | None, st
 
     mode is "new", "update", or "chat".
     """
-    _, output, warnings = run_claude(prompt, system_prompt=_build_system_prompt(), on_progress=on_progress)
+    _, output, warnings = run_claude(prompt, on_progress=on_progress)
 
     task_description = None
     repo_name = None
@@ -439,7 +371,7 @@ def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts:
         f"ユーザーにわかりやすく結果を報告してください。\n\n"
         + "\n".join(f"- {r}" for r in results)
     )
-    _, summary, _ = run_claude(summary_prompt, system_prompt=_build_system_prompt())
+    _, summary, _ = run_claude(summary_prompt)
     post(summary)
 
 
