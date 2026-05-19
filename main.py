@@ -24,6 +24,7 @@ WORKSPACE = Path(os.environ["WORKSPACE_DIR"])
 GITHUB_OWNER = os.environ["GITHUB_OWNER"]
 NOTIFY_CHANNEL = os.environ.get("SLACK_NOTIFY_CHANNEL", "")
 AGENT_GATEWAY_URL = os.environ.get("AGENT_GATEWAY_URL", "http://llm-internal-proxy/agent")
+_AGENT_GATEWAY_BASE = AGENT_GATEWAY_URL.rsplit("/agent", 1)[0] or AGENT_GATEWAY_URL
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
@@ -31,9 +32,10 @@ app = App(token=os.environ["SLACK_BOT_TOKEN"])
 _running: set[str] = set()
 
 # ---------------------------------------------------------------------------
-# Agent Gateway polling interval
+# Agent Gateway settings
 # ---------------------------------------------------------------------------
 _POLL_INTERVAL = 5  # seconds
+_TOKEN_CHECK_INTERVAL = 6 * 60 * 60  # 6 hours
 
 SYSTEM_PROMPT_TEMPLATE = """\
 あなたは自宅環境でホスティングされたClaudeの会話サービスです。
@@ -139,8 +141,8 @@ def run_claude(prompt: str, cwd: str | None = None, timeout: int = 1800,
                system_prompt: str | None = None,
                model: str | None = None,
                on_progress=None,
-               permissions: str = "full") -> tuple[int, str]:
-    """Run claude via Agent Gateway and return (returncode, output).
+               permissions: str = "full") -> tuple[int, str, list[str]]:
+    """Run claude via Agent Gateway and return (returncode, output, warnings).
 
     on_progress(elapsed_sec: int) is called periodically while the job runs.
     """
@@ -161,7 +163,7 @@ def run_claude(prompt: str, cwd: str | None = None, timeout: int = 1800,
         resp.raise_for_status()
     except requests.RequestException as e:
         logger.error("[agent-gateway] Failed to submit job: %s", e)
-        return 1, f"Agent Gateway error: {e}"
+        return 1, f"Agent Gateway error: {e}", []
 
     job_id = resp.json()["job_id"]
     logger.info("[agent-gateway] Job submitted: %s", job_id)
@@ -184,23 +186,27 @@ def run_claude(prompt: str, cwd: str | None = None, timeout: int = 1800,
             logger.warning("[agent-gateway] Poll error: %s", e)
             continue
 
+        warnings = data.get("warnings") or []
         status = data.get("status")
         if status == "done":
-            return data.get("exit_code", 0), data.get("result", "")
+            return data.get("exit_code", 0), data.get("result", ""), warnings
         elif status == "failed":
-            return data.get("exit_code", 1), data.get("error", "Job failed")
+            error = data.get("error", "Job failed")
+            if "[token-expired]" in error or "[auth-hint]" in error:
+                warnings.append(error)
+            return data.get("exit_code", 1), error, warnings
 
         if timeout and elapsed > timeout + 60:
             logger.error("[agent-gateway] Job %s exceeded timeout", job_id)
-            return 1, "Agent Gateway job timed out"
+            return 1, "Agent Gateway job timed out", []
 
 
-def chat(prompt: str, on_progress=None) -> tuple[str, str | None, str | None, str]:
-    """Send a prompt to Claude and return (response, task_description, repo_name, mode).
+def chat(prompt: str, on_progress=None) -> tuple[str, str | None, str | None, str, list[str]]:
+    """Send a prompt to Claude and return (response, task_description, repo_name, mode, warnings).
 
     mode is "new", "update", or "chat".
     """
-    _, output = run_claude(prompt, system_prompt=_build_system_prompt(), on_progress=on_progress)
+    _, output, warnings = run_claude(prompt, system_prompt=_build_system_prompt(), on_progress=on_progress)
 
     task_description = None
     repo_name = None
@@ -240,7 +246,7 @@ def chat(prompt: str, on_progress=None) -> tuple[str, str | None, str | None, st
         output = re.sub(r"\s*```name\s*\n.*?```", "", output, flags=re.DOTALL).strip()
         output = output.replace("**GO**", "").replace("**UPDATE**", "").strip()
 
-    return output, task_description, repo_name, mode
+    return output, task_description, repo_name, mode, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +335,7 @@ def run_implementation(project_dir: Path, task_description: str,
         if on_progress and elapsed_min > 0:
             on_progress(elapsed_min)
 
-    returncode, output = run_claude(
+    returncode, output, warnings = run_claude(
         prompt=f"/direct-task {task_description}",
         cwd=str(project_dir),
         timeout=1800,
@@ -342,6 +348,9 @@ def run_implementation(project_dir: Path, task_description: str,
                 returncode, len(output))
     logger.debug("[implementation] output: %s", output[:1000])
 
+    if warnings:
+        for w in warnings:
+            logger.warning("[implementation] %s", w)
     if returncode != 0:
         logger.error("[implementation] claude failed (rc=%d): %s", returncode, output[:500])
     return returncode == 0
@@ -430,7 +439,7 @@ def run_pipeline(repo_name: str, task_description: str, channel: str, thread_ts:
         f"ユーザーにわかりやすく結果を報告してください。\n\n"
         + "\n".join(f"- {r}" for r in results)
     )
-    _, summary = run_claude(summary_prompt, system_prompt=_build_system_prompt())
+    _, summary, _ = run_claude(summary_prompt, system_prompt=_build_system_prompt())
     post(summary)
 
 
@@ -477,10 +486,16 @@ def _respond_with_progress(channel: str, reply_thread: str, text: str, thread_ts
         prompt = f"現在時刻（日本時間）: {now}\n\nユーザー: {text}"
 
     try:
-        response, task_description, repo_name, mode = chat(prompt, on_progress=on_progress)
+        response, task_description, repo_name, mode, warnings = chat(prompt, on_progress=on_progress)
     except Exception:
         logger.exception("Claude chat failed")
-        response, task_description, repo_name, mode = "ちょっとエラーが起きちゃった :sweat_smile: もう一度試してみて！", None, None, "chat"
+        response, task_description, repo_name, mode, warnings = (
+            "ちょっとエラーが起きちゃった :sweat_smile: もう一度試してみて！", None, None, "chat", [],
+        )
+
+    if warnings:
+        warning_text = "\n".join(f":warning: {w}" for w in warnings)
+        response = f"{response}\n\n{warning_text}"
 
     try:
         app.client.chat_update(channel=channel, ts=status_ts, text=response)
@@ -518,6 +533,52 @@ def handle_message(event, say, client):
     ).start()
 
 
+# ---------------------------------------------------------------------------
+# Token expiry monitor
+# ---------------------------------------------------------------------------
+
+def _check_token_health():
+    """Check Agent Gateway /health for token expiry and notify via Slack."""
+    if not NOTIFY_CHANNEL:
+        logger.debug("[token-monitor] SLACK_NOTIFY_CHANNEL not set, skipping")
+        return
+    try:
+        resp = requests.get(f"{_AGENT_GATEWAY_BASE}/health", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        logger.warning("[token-monitor] Health check failed: %s", e)
+        return
+
+    warning = data.get("token_warning")
+    if not warning:
+        return
+
+    days = data.get("token_days_remaining", "?")
+    expires_at = data.get("token_expires_at", "不明")
+    if isinstance(days, int) and days < 0:
+        icon = ":rotating_light:"
+        text = f"{icon} *Claude トークン期限切れ*\n{warning}\n有効期限: {expires_at}"
+    else:
+        icon = ":warning:"
+        text = f"{icon} *Claude トークン期限警告*\n{warning}\n残り {days} 日 (有効期限: {expires_at})"
+
+    try:
+        app.client.chat_postMessage(channel=NOTIFY_CHANNEL, text=text)
+        logger.info("[token-monitor] Notified channel %s: %s", NOTIFY_CHANNEL, warning)
+    except Exception:
+        logger.exception("[token-monitor] Failed to send notification")
+
+
+def _token_monitor_loop():
+    """Background loop that checks token health periodically."""
+    time.sleep(10)
+    while True:
+        _check_token_health()
+        time.sleep(_TOKEN_CHECK_INTERVAL)
+
+
 if __name__ == "__main__":
+    threading.Thread(target=_token_monitor_loop, daemon=True).start()
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
