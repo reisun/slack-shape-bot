@@ -69,8 +69,15 @@ def _build_conversation_prompt(messages: list[dict], bot_user_id: str | None) ->
 # claude CLI helper
 # ---------------------------------------------------------------------------
 
-def run_claude(prompt: str, cwd: str | None = None, timeout: int = 1800,
-               system_prompt: str | None = None,
+_SYSTEM_PROMPT = (
+    "あなたは自宅サーバー上の Docker コンテナ内で動作しています。"
+    " /workspace/ に全プロジェクトがマウントされており、"
+    " docker / docker compose / gh CLI が利用可能です。"
+    " 日本語で応答してください。"
+)
+
+
+def run_claude(prompt: str, timeout: int = 1800,
                model: str | None = None,
                on_progress=None,
                permissions: str = "full") -> tuple[int, str, list[str]]:
@@ -81,12 +88,11 @@ def run_claude(prompt: str, cwd: str | None = None, timeout: int = 1800,
     payload = {
         "agent": "claude",
         "prompt": prompt,
-        "cwd": cwd or str(WORKSPACE),
+        "cwd": str(WORKSPACE),
         "timeout": timeout,
         "permissions": permissions,
+        "system_prompt": _SYSTEM_PROMPT,
     }
-    if system_prompt:
-        payload["system_prompt"] = system_prompt
     if model:
         payload["model"] = model
 
@@ -269,7 +275,6 @@ def run_implementation(project_dir: Path, task_description: str,
 
     returncode, output, warnings = run_claude(
         prompt=f"/direct-task {task_description}",
-        cwd=str(project_dir),
         timeout=1800,
         model="sonnet",
         on_progress=on_progress_min,
